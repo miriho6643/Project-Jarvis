@@ -420,7 +420,7 @@ def ask_ai(text):
         summary = summary + "\n" + summarize_conversation(conversation_history[1:-8]) if summary else summarize_conversation(conversation_history[1:-8])
         conversation_history = [conversation_history[0]] + conversation_history[-8:]; save_memory()
 
-    response, _ = chat_with_fallback(conversation_history, model_list)
+    response, _ = chat_with_fallback((conversation_history + [{"role": "summary", "content": summary}]), model_list)
     msg = response.choices[0].message
     if msg.tool_calls:
         conversation_history.append(msg.model_dump(exclude_none=True))
@@ -429,7 +429,7 @@ def ask_ai(text):
             conversation_history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
         final, _ = chat_with_fallback(conversation_history, model_list); ai_message = final.choices[0].message.content
     else: ai_message = msg.content
-    conversation_history.append({"role": "assistant", "content": ai_message}); save_memory(); return ai_message.replace("*", "")
+    conversation_history.append({"role": "assistant", "content": ai_message}); save_memory(); return ai_message
 
 # ========= 5. SPEECH LOOP =========
 r = sr.Recognizer()
@@ -437,7 +437,6 @@ def listen(timeout=60):
     try:
         with sr.Microphone(**MIC_ARGS) as source:
             r.adjust_for_ambient_noise(source, duration=0.1)
-
             print("...höre zu")
 
             r.pause_threshold = 1.0
