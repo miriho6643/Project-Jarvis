@@ -1,12 +1,15 @@
 from dotenv import load_dotenv
 from openai import OpenAI
 import os, json, re, threading, time, subprocess, requests
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, urlencode, urlparse, unquote
 import numpy as np
 import speech_recognition as sr
 import openwakeword
 import sounddevice as sd
 from piper import PiperVoice
 from mcrcon import MCRcon # pip install mcrcon
+
 
 # ========= 1. SETUP =========
 load_dotenv()
@@ -22,6 +25,8 @@ MODELS = [
     "liquid/lfm-2.5-2.6b:free"
 ]
 DECISION_MODEL = "minimax/minimax-m3:free"
+DECISION_MODELS = [DECISION_MODEL]
+DECISION_MODELS_BACKUP = [DECISION_MODEL, "nvidia/nemotron-3.5-lightning:free"]
 MODEL_LATENCIES = {}
 LATENCY_LOCK = threading.Lock()
 MODEL_BASED = {
@@ -63,6 +68,136 @@ MODEL_BASED = {
         "Data Transformation": ["liquid/lfm-2.5-2.6b:free", "minimax/minimax-m3:free", "google/gemma-4-31b-it:free"]
     }
 }
+MODEL_BASED_BACKUP = {
+    group: {task: model_ids.copy() for task, model_ids in tasks.items()}
+    for group, tasks in MODEL_BASED.items()
+}
+
+MODEL_CATALOG_LOCK = threading.RLock()
+TASK_MODEL_HINTS = {
+    "Classification": ("classification", "classify", "categorization"),
+    "Q&A & Knowledge": ("question answering", "knowledge", "factual", "reasoning"),
+    "Summarization": ("summarization", "summary", "long context"),
+    "Roleplay & Fiction": ("roleplay", "creative writing", "storytelling"),
+    "Customer Support": ("customer support", "customer service", "conversation"),
+    "Conversation": ("chat", "conversation", "instruction following"),
+    "Context Writing": ("writing", "content generation", "long context"),
+    "Research & Reports": ("research", "analysis", "report", "reasoning"),
+    "Math": ("mathematics", "math", "numerical reasoning"),
+    "Security Audit": ("security", "code analysis", "vulnerability"),
+    "Finance & Trading": ("finance", "financial", "quantitative"),
+    "Translation": ("translation", "multilingual"),
+    "DevOps": ("devops", "infrastructure", "deployment", "coding"),
+    "Code Generation": ("code generation", "coding", "programming", "software engineering"),
+    "Debugging": ("debugging", "code analysis", "software engineering"),
+    "File I/O": ("file handling", "coding", "tool use"),
+    "Shell Execution": ("terminal", "command line", "tool use", "coding"),
+    "Code Review": ("code review", "coding", "software engineering"),
+    "Frontend & UI": ("frontend", "web development", "user interface", "coding"),
+    "Repo Scanning": ("repository", "codebase", "coding", "long context"),
+    "SQL & Database": ("sql", "database", "data analysis", "coding"),
+    "DevOps & Config": ("devops", "configuration", "coding", "tool use"),
+    "Workflow Execution": ("workflow", "agent", "tool use", "function calling"),
+    "Multi-step Planning": ("planning", "reasoning", "agent"),
+    "Web Research": ("web research", "search", "reasoning", "agent"),
+    "Tool Dispatch": ("tool use", "function calling", "agent"),
+    "Memory Extraction": ("information extraction", "structured data", "long context"),
+    "Data Extraction": ("data extraction", "structured output", "json"),
+    "Data Transformation": ("data transformation", "structured output", "json")
+}
+
+def refresh_model_decision_list():
+    """Rank up to three current free models per task, retaining curated backups."""
+    global DECISION_MODEL, DECISION_MODELS, MODELS
+    try:
+        response = requests.get("https://openrouter.ai/api/v1/models", timeout=12)
+        response.raise_for_status()
+        catalog = response.json().get("data", [])
+        free_models = [
+            model for model in catalog
+            if model.get("id", "").endswith(":free")
+            and "text" in model.get("architecture", {}).get("output_modalities", [])
+        ]
+        if not free_models:
+            raise ValueError("OpenRouter catalog contained no free text models")
+
+        def created(model):
+            try:
+                return int(model.get("created", 0))
+            except (TypeError, ValueError):
+                return 0
+
+        newest = sorted(free_models, key=created, reverse=True)
+        by_id = {model["id"]: model for model in free_models}
+        updated = {}
+        for group, tasks in MODEL_BASED_BACKUP.items():
+            updated[group] = {}
+            for task, backup_models in tasks.items():
+                task_words = tuple(
+                    word.casefold() for word in re.findall(r"[a-z0-9]+", task)
+                    if len(word) > 2 and word.casefold() not in {"and", "for", "the"}
+                )
+                hints = TASK_MODEL_HINTS.get(task, ())
+
+                def relevance(model):
+                    description = f"{model.get('name', '')} {model.get('description', '')}".casefold()
+                    score = sum(3 for word in task_words if word in description)
+                    score += sum(4 for hint in hints if hint in description)
+                    if model["id"] in backup_models:
+                        score += 5
+                    parameters = model.get("supported_parameters", [])
+                    if "tools" in parameters and group in ("Agent", "Code"):
+                        score += 2
+                    try:
+                        coding_score = float(
+                            model.get("benchmarks", {}).get("artificial_analysis", {}).get("coding_index") or 0
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        coding_score = 0
+                    if group == "Code":
+                        score += coding_score / 25
+                    return score
+
+                matching = sorted(
+                    free_models,
+                    key=lambda model: (relevance(model), created(model)),
+                    reverse=True
+                )
+                candidates = [model["id"] for model in matching[:3] if relevance(model) > 0]
+                candidates.extend(model_id for model_id in backup_models if model_id in by_id)
+                candidates.extend(model["id"] for model in newest if model["id"] not in candidates)
+                updated[group][task] = list(dict.fromkeys(candidates))[:3]
+
+        tool_models = sorted(
+            (model for model in free_models if "tools" in model.get("supported_parameters", [])),
+            key=lambda model: (
+                "tool calling" in model.get("description", "").casefold()
+                or "agent" in model.get("description", "").casefold(),
+                created(model)
+            ),
+            reverse=True
+        )
+        with MODEL_CATALOG_LOCK:
+            MODEL_BASED.clear()
+            MODEL_BASED.update(updated)
+            if tool_models:
+                DECISION_MODELS = [model["id"] for model in tool_models[:3]]
+                DECISION_MODEL = DECISION_MODELS[0]
+                MODELS = DECISION_MODELS.copy()
+        print(f"[MODELS] refreshed {len(free_models)} free models; decision candidates: {DECISION_MODELS}")
+        return True
+    except Exception as error:
+        print(f"[MODELS] catalog refresh failed; keeping configured model list: {error}")
+        return False
+
+def model_catalog_refresher():
+    while True:
+        refresh_model_decision_list()
+        time.sleep(3600)
+
+# Replace stale baked-in IDs before Jarvis can route its first request.
+refresh_model_decision_list()
+threading.Thread(target=model_catalog_refresher, daemon=True).start()
 
 def order_models_by_latency(model_list):
     """Put measured fastest models first while preserving unknown model order."""
@@ -95,7 +230,7 @@ tools = []
 device_lock = threading.Lock()
 openwakeword.utils.download_models()
 
-DEFAULT_HISTORY = [{"role": "system", "content": "Du bist Jarvis. Steuere Geräte mit do/with. Für Minecraft nutze minecraft_command. Du darfst keine Formatierungen Listen oder Emojis nutzen da du auf Sprache antwortest."}]
+DEFAULT_HISTORY = [{"role": "system", "content": "Du bist Jarvis. Steuere Geräte mit do/with. Für Minecraft nutze minecraft_command. Du darfst keine Formatierungen Listen oder Emojis nutzen da du auf Sprache antwortest. Nutze nur die Sprache Deutsch und keine andere Sprache. Gib ausnahmslos eine Antwort wieder."}]
 
 # Memory
 conversation_history = DEFAULT_HISTORY.copy()
@@ -162,9 +297,153 @@ def minecraft_command(command: str):
     except Exception as e:
         return f"Fehler bei RCON: {e}"
 
+class DuckDuckGoResultsParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._active = None
+        self._field = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        classes = attributes.get("class", "").split()
+        if tag == "a" and "result__a" in classes:
+            url = attributes.get("href", "")
+            parsed = urlparse(url)
+            if parsed.netloc.endswith("duckduckgo.com") and parsed.path == "/l/":
+                url = parse_qs(parsed.query).get("uddg", [url])[0]
+            self._active = {"title": "", "url": unquote(url), "snippet": ""}
+            self._field = "title"
+        elif tag in ("a", "div") and "result__snippet" in classes and self.results:
+            self._active = self.results[-1]
+            self._field = "snippet"
+    def handle_data(self, data):
+        if self._active and self._field:
+            self._active[self._field] += data
+
+    def handle_endtag(self, tag):
+        if self._active and tag == "a" and self._field == "title":
+            if self._active["title"].strip() and self._active["url"]:
+                self.results.append(self._active)
+            self._active = None
+            self._field = None
+        elif self._field == "snippet" and tag in ("a", "div"):
+            self._active = None
+            self._field = None
+
+def web_search(query: str, max_results: int = 5):
+    """Search the web and return titles, snippets, and source URLs."""
+    query = query.strip()
+    if not query:
+        return "Suchanfrage darf nicht leer sein."
+    max_results = max(1, min(int(max_results), 10))
+    try:
+        response = requests.get(
+            "https://html.duckduckgo.com/html/?" + urlencode({"q": query}),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Jarvis/1.0"},
+            timeout=12
+        )
+        response.raise_for_status()
+        parser = DuckDuckGoResultsParser()
+        parser.feed(response.text)
+        results = parser.results[:max_results]
+        if not results:
+            return "Keine Web-Ergebnisse gefunden."
+        return "\n\n".join(
+            f"{index}. {item['title'].strip()}\n{item['snippet'].strip()}\n{item['url']}"
+            for index, item in enumerate(results, 1)
+        )
+    except Exception as error:
+        return f"Websuche fehlgeschlagen: {error}"
+
+def terminal_command(command: str, timeout: int = 10):
+    """Run a local Windows CMD command in the project directory with bounded output/time."""
+    command = command.strip()
+    if not command:
+        return "CMD-Befehl darf nicht leer sein."
+    timeout = max(1, min(int(timeout), 60))
+    try:
+        result = subprocess.run(
+            [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False
+        )
+        output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+        output = output or "Befehl erfolgreich ausgeführt, aber keine Ausgabe."
+        if len(output) > 12000:
+            output = output[:12000] + "\n[Ausgabe gekürzt]"
+        return f"Exit-Code {result.returncode}\n{output}"
+    except subprocess.TimeoutExpired:
+        return f"Befehl '{command}' hat die Zeitüberschreitung von {timeout} Sekunden überschritten."
+    except Exception as e:
+        return f"Fehler beim Ausführen des Befehls '{command}': {e}"
+
+web_terminal_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Durchsucht das aktuelle Internet nach Informationen. "
+                "Nutze dieses Tool für aktuelle Nachrichten, aktuelle "
+                "Software-Versionen, Preise, Fakten oder wenn ausdrücklich "
+                "eine Websuche gewünscht wird."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Die Suchanfrage.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Anzahl der Ergebnisse, 1 bis 10.",
+                        "minimum": 1,
+                        "maximum": 10,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_command",
+            "description": (
+                "Führt einen lokalen Terminal- oder Shell-Befehl auf dem "
+                "Computer aus. Nutze es für lokale Dateien, Programme, "
+                "Systeminformationen, Python-Befehle und andere Shell-Aufgaben."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Der auszuführende Terminal-Befehl.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Maximale Laufzeit in Sekunden, 1 bis 60.",
+                        "minimum": 1,
+                        "maximum": 60,
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+]
+
 def generate_ha_tools():
     global tools
-    new_tools = []; ha_functions = {}
+    new_tools = web_terminal_tools.copy(); ha_functions = {}
     try:
         devices = requests.get(f"{HA_URL}/states", headers=HEADERS, timeout=5).json()
         print(f"[UPDATE] Lade {len(devices)} Geräte...")
@@ -322,35 +601,45 @@ TASK_KEYWORDS = {
 
 def select_models(text):
     """Use a free AI model to select the ranked models for the user's request."""
-    available_tasks = {
-        group: list(tasks.keys()) for group, tasks in MODEL_BASED.items()
-    }
+    with MODEL_CATALOG_LOCK:
+        available_tasks = {
+            group: list(tasks.keys()) for group, tasks in MODEL_BASED.items()
+        }
+        decision_candidates = list(dict.fromkeys(DECISION_MODELS + DECISION_MODELS_BACKUP))[:3]
     decision_prompt = (
-        "Ordne die Benutzeranfrage genau einer Gruppe und einer Aufgabe zu. "
-        "Waehle ausschliesslich aus dieser JSON-Taxonomie: "
+        "Classify the user's request into exactly one group and task from this taxonomy. "
+        "Return only a compact JSON object with exactly the keys group and task. "
+        "Do not explain or use markdown. Taxonomy: "
         f"{json.dumps(available_tasks, ensure_ascii=True)}. "
-        "Antworte ausschliesslich als JSON mit den Schluesseln group und task."
     )
-    try:
-        response = client.chat.completions.create(
-            model=DECISION_MODEL,
-            messages=[
-                {"role": "system", "content": decision_prompt},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=100
-        )
-        decision_message = response.choices[0].message
-        decision_text = decision_message.content or getattr(decision_message, "reasoning", "") or ""
-        decision = parse_model_decision(decision_text, available_tasks)
-        group = decision["group"]
-        task = decision["task"]
-        if group in MODEL_BASED and task in MODEL_BASED[group]:
-            selected_models = order_models_by_latency(MODEL_BASED[group][task])
-            print(f"[DECISION] {group} / {task}: {', '.join(selected_models)}")
-            return selected_models
-    except Exception as error:
-        print(f"[DECISION ERROR] {error}")
+    decision_errors = []
+    for decision_model in decision_candidates:
+        try:
+            response = client.chat.completions.create(
+                model=decision_model,
+                messages=[
+                    {"role": "system", "content": decision_prompt},
+                    {"role": "user", "content": text}
+                ],
+                max_tokens=100,
+                temperature=0
+            )
+            decision_message = response.choices[0].message
+            decision_text = decision_message.content or getattr(decision_message, "reasoning", "") or ""
+            decision = parse_model_decision(decision_text, available_tasks)
+            group = decision["group"]
+            task = decision["task"]
+            with MODEL_CATALOG_LOCK:
+                configured_models = MODEL_BASED.get(group, {}).get(task, [])
+            if configured_models:
+                selected_models = order_models_by_latency(configured_models[:3])
+                print(f"[DECISION] {group} / {task}: {', '.join(selected_models)}")
+                return selected_models
+        except Exception as error:
+            decision_errors.append(f"{decision_model}: {error}")
+
+    if decision_errors:
+        print(f"[DECISION] AI classification unavailable; using backup router ({'; '.join(decision_errors)})")
 
     # Keep the assistant usable when the decision model is unavailable.
     normalized = text.casefold()
@@ -366,7 +655,9 @@ def select_models(text):
     else:
         _, group, task = max(scores, key=lambda match: match[0])
 
-    selected_models = order_models_by_latency(MODEL_BASED[group][task])
+    with MODEL_CATALOG_LOCK:
+        configured_models = MODEL_BASED[group][task][:3]
+    selected_models = order_models_by_latency(configured_models)
     print(f"[ROUTER] {group} / {task}: {', '.join(selected_models)}")
     return selected_models
 
@@ -420,7 +711,7 @@ def ask_ai(text):
         summary = summary + "\n" + summarize_conversation(conversation_history[1:-8]) if summary else summarize_conversation(conversation_history[1:-8])
         conversation_history = [conversation_history[0]] + conversation_history[-8:]; save_memory()
 
-    response, _ = chat_with_fallback((conversation_history + [{"role": "summary", "content": summary}]), model_list)
+    response, _ = chat_with_fallback(conversation_history, model_list)
     msg = response.choices[0].message
     if msg.tool_calls:
         conversation_history.append(msg.model_dump(exclude_none=True))
