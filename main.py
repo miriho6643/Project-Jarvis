@@ -228,6 +228,7 @@ MIC_ARGS = {"sample_rate": 16000, "chunk_size": 1280, "device_index": 1} # Mikro
 
 tools = []
 device_lock = threading.Lock()
+keep_listening_event = threading.Event()
 openwakeword.utils.download_models()
 
 DEFAULT_HISTORY = [{"role": "system", "content": "Du bist Jarvis. Steuere Geräte mit do/with. Für Minecraft nutze minecraft_command. Du darfst keine Formatierungen Listen oder Emojis nutzen da du auf Sprache antwortest. Nutze nur die Sprache Deutsch und keine andere Sprache. Gib ausnahmslos eine Antwort wieder."}]
@@ -383,6 +384,11 @@ def terminal_command(command: str, timeout: int = 10):
     except Exception as e:
         return f"Fehler beim Ausführen des Befehls '{command}': {e}"
 
+def keep_listening():
+    """Listen for one follow-up utterance without requiring the wakeword."""
+    keep_listening_event.set()
+    return "Ich höre direkt auf deine nächste Frage. Danach ist wieder das Wakeword nötig."
+
 web_terminal_tools = [
     {
         "type": "function",
@@ -437,6 +443,19 @@ web_terminal_tools = [
                 },
                 "required": ["command"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keep_listening",
+            "description": (
+                "Nimm genau eine weitere gesprochene Nutzereingabe ohne Wakeword entgegen. "
+                "Verwende das Tool, wenn der Nutzer eine Rückfrage ankündigt oder Jarvis "
+                "nach der Antwort direkt für eine Folgefrage bereit sein soll. Danach wird "
+                "das normale Wakeword wieder benötigt."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
@@ -521,7 +540,7 @@ def generate_ha_tools():
     try:
 
         # Statische PC + MC Tools
-        ha_functions.update({"set_volume": set_volume, "open_app": open_app, "get_time": get_time, "minecraft_command": minecraft_command})
+        ha_functions.update({"set_volume": set_volume, "open_app": open_app, "get_time": get_time, "minecraft_command": minecraft_command, "keep_listening": keep_listening})
         new_tools.extend(static_tools)
         new_tools.append({"type": "function", "function": {"name": "minecraft_command", "description": "Führt einen Befehl auf dem Minecraft Server aus. Nutze Minecraft Syntax ohne /", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Bsp: gamemode creative @p"}}, "required": ["command"]}}})
 
@@ -609,6 +628,7 @@ def select_models(text):
     decision_prompt = (
         "Classify the user's request into exactly one group and task from this taxonomy. "
         "Return only a compact JSON object with exactly the keys group and task. "
+        "Example: {\"group\":\"General\",\"task\":\"Math\"}. "
         "Do not explain or use markdown. Taxonomy: "
         f"{json.dumps(available_tasks, ensure_ascii=True)}. "
     )
@@ -622,7 +642,8 @@ def select_models(text):
                     {"role": "user", "content": text}
                 ],
                 max_tokens=100,
-                temperature=0
+                temperature=0,
+                response_format={"type": "json_object"}
             )
             decision_message = response.choices[0].message
             decision_text = decision_message.content or getattr(decision_message, "reasoning", "") or ""
@@ -662,8 +683,11 @@ def select_models(text):
     return selected_models
 
 def parse_model_decision(decision_text, available_tasks):
-    """Parse strict JSON and common free-model response variants safely."""
+    """Normalize common decision-model schemas into a validated group/task pair."""
     decision_text = decision_text.strip()
+    if not decision_text:
+        raise ValueError("Decision model returned empty content")
+
     try:
         decision = json.loads(decision_text)
     except json.JSONDecodeError:
@@ -671,17 +695,61 @@ def parse_model_decision(decision_text, available_tasks):
         if json_match:
             decision = json.loads(json_match.group(0))
         else:
-            group_match = re.search(r"(?:group|gruppe)\s*[:=]\s*[`\"']?([^`\"'\n,]+)", decision_text, re.IGNORECASE)
-            task_match = re.search(r"(?:task|aufgabe)\s*[:=]\s*[`\"']?([^`\"'\n]+)", decision_text, re.IGNORECASE)
+            group_match = re.search(
+                r"(?:group|gruppe|macro[_ ]category|category)\s*[:=]\s*[`\"']?([^`\"'\n,]+)",
+                decision_text,
+                re.IGNORECASE
+            )
+            task_match = re.search(
+                r"(?:task|aufgabe|display[_ ]name|task[_ ]name)\s*[:=]\s*[`\"']?([^`\"'\n]+)",
+                decision_text,
+                re.IGNORECASE
+            )
             if not group_match or not task_match:
-                raise ValueError("Decision model returned no usable group/task")
+                raise ValueError(f"Decision model returned no usable group/task: {decision_text[:160]!r}")
             decision = {"group": group_match.group(1).strip(), "task": task_match.group(1).strip()}
 
-    group = str(decision.get("group", "")).strip()
-    task = str(decision.get("task", "")).strip()
-    if group not in available_tasks or task not in available_tasks[group]:
-        raise ValueError(f"Invalid decision: {group} / {task}")
-    return {"group": group, "task": task}
+    if not isinstance(decision, dict):
+        raise ValueError("Decision must be a JSON object")
+
+    def normalize(value):
+        return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+    group_value = next(
+        (decision[key] for key in ("group", "macro_category", "macroCategory", "category") if key in decision),
+        ""
+    )
+    task_value = next(
+        (decision[key] for key in ("task", "task_name", "taskName", "display_name", "displayName", "classification") if key in decision),
+        ""
+    )
+    group_normalized = normalize(group_value)
+    task_normalized = normalize(task_value)
+    normalized_groups = {normalize(group): group for group in available_tasks}
+    group = normalized_groups.get(group_normalized)
+
+    task_matches = [
+        (candidate_group, candidate_task)
+        for candidate_group, candidate_tasks in available_tasks.items()
+        for candidate_task in candidate_tasks
+        if normalize(candidate_task) == task_normalized
+    ]
+    if not task_matches and task_normalized:
+        task_matches = [
+            (candidate_group, candidate_task)
+            for candidate_group, candidate_tasks in available_tasks.items()
+            for candidate_task in candidate_tasks
+            if normalize(candidate_task) in task_normalized or task_normalized in normalize(candidate_task)
+        ]
+
+    if group and task_matches:
+        matching_task = next((match for match in task_matches if match[0] == group), None)
+        if matching_task:
+            return {"group": matching_task[0], "task": matching_task[1]}
+    elif not group and len(task_matches) == 1:
+        return {"group": task_matches[0][0], "task": task_matches[0][1]}
+
+    raise ValueError(f"Invalid decision fields: group={group_value!r}, task={task_value!r}")
 
 def chat_with_fallback(messages, model_list=None):
     with device_lock: current_tools = tools.copy()
@@ -724,6 +792,7 @@ def ask_ai(text):
 
 # ========= 5. SPEECH LOOP =========
 r = sr.Recognizer()
+
 def listen(timeout=60):
     try:
         with sr.Microphone(**MIC_ARGS) as source:
@@ -766,20 +835,28 @@ if __name__ == "__main__":
     print(">>> Sag 'Hey Jarvis' <<<")
     while True:
         try:
-            with sr.Microphone(**MIC_ARGS) as source:
-                # Wakeword detection must process short, continuous 16 kHz PCM frames.
-                while True:
-                    audio_bytes = source.stream.read(MIC_ARGS["chunk_size"])
-                    audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
-                    if len(audio_data) != MIC_ARGS["chunk_size"]:
-                        continue
+            if keep_listening_event.is_set():
+                keep_listening_event.clear()
+            else:
+                with sr.Microphone(**MIC_ARGS) as source:
+                    # Wakeword detection must process short, continuous 16 kHz PCM frames.
+                    while True:
+                        if keep_listening_event.is_set():
+                            keep_listening_event.clear()
+                            print(">>> Folgefrage ohne Wakeword. <<<")
+                            break
 
-                    prediction = oww.predict(audio_data)
-                    if prediction.get(WAKEWORD_MODEL, 0) > 0.5:
-                        print(">>> Wakeword erkannt! <<<")
-                        prediction = {}
-                        oww.reset()
-                        break
+                        audio_bytes = source.stream.read(MIC_ARGS["chunk_size"])
+                        audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+                        if len(audio_data) != MIC_ARGS["chunk_size"]:
+                            continue
+
+                        prediction = oww.predict(audio_data)
+                        if prediction.get(WAKEWORD_MODEL, 0) > 0.5:
+                            print(">>> Wakeword erkannt! <<<")
+                            prediction = {}
+                            oww.reset()
+                            break
 
             try:
                 user_text = listen()
