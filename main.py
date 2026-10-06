@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import os, json, re, threading, time, subprocess, requests
 from html.parser import HTMLParser
-from urllib.parse import parse_qs, urlencode, urlparse, unquote
+from urllib.parse import urlencode
 import numpy as np
 import speech_recognition as sr
 import openwakeword
@@ -24,7 +24,7 @@ MODELS = [
     "minimax/minimax-m3:free",
     "liquid/lfm-2.5-2.6b:free"
 ]
-DECISION_MODEL = "minimax/minimax-m3:free"
+DECISION_MODEL = "openrouter/free"
 DECISION_MODELS = [DECISION_MODEL]
 DECISION_MODELS_BACKUP = [DECISION_MODEL, "nvidia/nemotron-3.5-lightning:free"]
 MODEL_LATENCIES = {}
@@ -74,6 +74,7 @@ MODEL_BASED_BACKUP = {
 }
 
 MODEL_CATALOG_LOCK = threading.RLock()
+UNAVAILABLE_FREE_MODELS = set()
 TASK_MODEL_HINTS = {
     "Classification": ("classification", "classify", "categorization"),
     "Q&A & Knowledge": ("question answering", "knowledge", "factual", "reasoning"),
@@ -117,6 +118,7 @@ def refresh_model_decision_list():
             model for model in catalog
             if model.get("id", "").endswith(":free")
             and "text" in model.get("architecture", {}).get("output_modalities", [])
+            and model.get("id") not in UNAVAILABLE_FREE_MODELS
         ]
         if not free_models:
             raise ValueError("OpenRouter catalog contained no free text models")
@@ -190,6 +192,27 @@ def refresh_model_decision_list():
         print(f"[MODELS] catalog refresh failed; keeping configured model list: {error}")
         return False
 
+def evict_unavailable_free_model(model_id):
+    """Permanently remove a free slug after OpenRouter reports it is now paid/unavailable."""
+    global DECISION_MODEL, DECISION_MODELS, MODELS
+    if not model_id or not model_id.endswith(":free"):
+        return
+    with MODEL_CATALOG_LOCK:
+        UNAVAILABLE_FREE_MODELS.add(model_id)
+        for task_map in MODEL_BASED.values():
+            for task, candidates in task_map.items():
+                task_map[task] = [candidate for candidate in candidates if candidate != model_id]
+        DECISION_MODELS = [candidate for candidate in DECISION_MODELS if candidate != model_id]
+        MODELS = [candidate for candidate in MODELS if candidate != model_id]
+        if DECISION_MODEL == model_id:
+            DECISION_MODEL = next(iter(DECISION_MODELS), "")
+    print(f"[MODELS] evicted unavailable free model: {model_id}")
+    refresh_model_decision_list()
+
+def is_free_model_unavailable_error(error):
+    message = str(error).casefold()
+    return "unavailable for free" in message or "paid version is available" in message
+
 def model_catalog_refresher():
     while True:
         refresh_model_decision_list()
@@ -231,7 +254,7 @@ device_lock = threading.Lock()
 keep_listening_event = threading.Event()
 openwakeword.utils.download_models()
 
-DEFAULT_HISTORY = [{"role": "system", "content": "Du bist Jarvis. Steuere Geräte mit do/with. Für Minecraft nutze minecraft_command. Du darfst keine Formatierungen Listen oder Emojis nutzen da du auf Sprache antwortest. Nutze nur die Sprache Deutsch und keine andere Sprache. Gib ausnahmslos eine Antwort wieder."}]
+DEFAULT_HISTORY = [{"role": "system", "content": "Du bist Jarvis. Steuere Geräte mit do/with. Für Minecraft nutze minecraft_command. Du darfst keine Formatierungen Listen oder Emojis nutzen da du auf Sprache antwortest. Nutze nur die Sprache Deutsch und keine andere Sprache. Gib ausnahmslos eine Antwort wieder. Sobald du eine Frage stellst, nutze den Keep Listening Command um den User antworten zu lassen."}]
 
 # Memory
 conversation_history = DEFAULT_HISTORY.copy()
@@ -298,54 +321,55 @@ def minecraft_command(command: str):
     except Exception as e:
         return f"Fehler bei RCON: {e}"
 
-class DuckDuckGoResultsParser(HTMLParser):
+class BingResultsParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.results = []
-        self._active = None
-        self._field = None
+        self._result = None
+        self._capture = None
 
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
         classes = attributes.get("class", "").split()
-        if tag == "a" and "result__a" in classes:
-            url = attributes.get("href", "")
-            parsed = urlparse(url)
-            if parsed.netloc.endswith("duckduckgo.com") and parsed.path == "/l/":
-                url = parse_qs(parsed.query).get("uddg", [url])[0]
-            self._active = {"title": "", "url": unquote(url), "snippet": ""}
-            self._field = "title"
-        elif tag in ("a", "div") and "result__snippet" in classes and self.results:
-            self._active = self.results[-1]
-            self._field = "snippet"
+        if tag == "li" and "b_algo" in classes:
+            self._result = {"title": "", "url": "", "snippet": ""}
+        elif self._result is not None and tag == "a" and not self._result["title"]:
+            self._result["title"] = ""
+            self._result["url"] = attributes.get("href", "")
+            self._capture = "title"
+        elif self._result is not None and tag == "p":
+            self._capture = "snippet"
+
     def handle_data(self, data):
-        if self._active and self._field:
-            self._active[self._field] += data
+        if self._result is not None and self._capture:
+            self._result[self._capture] += data.strip() + " "
 
     def handle_endtag(self, tag):
-        if self._active and tag == "a" and self._field == "title":
-            if self._active["title"].strip() and self._active["url"]:
-                self.results.append(self._active)
-            self._active = None
-            self._field = None
-        elif self._field == "snippet" and tag in ("a", "div"):
-            self._active = None
-            self._field = None
+        if tag in ("a", "p"):
+            self._capture = None
+        elif tag == "li" and self._result is not None:
+            self._result = {key: value.strip() for key, value in self._result.items()}
+            if self._result["title"] and self._result["url"]:
+                self.results.append(self._result)
+            self._result = None
 
 def web_search(query: str, max_results: int = 5):
-    """Search the web and return titles, snippets, and source URLs."""
+    """Search the web with Bing and return titles, snippets, and source URLs."""
     query = query.strip()
     if not query:
         return "Suchanfrage darf nicht leer sein."
     max_results = max(1, min(int(max_results), 10))
     try:
         response = requests.get(
-            "https://html.duckduckgo.com/html/?" + urlencode({"q": query}),
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Jarvis/1.0"},
+            "https://www.bing.com/search?" + urlencode({"q": query}),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+                "Accept-Language": "de-DE,de;q=0.9,en;q=0.8"
+            },
             timeout=12
         )
         response.raise_for_status()
-        parser = DuckDuckGoResultsParser()
+        parser = BingResultsParser()
         parser.feed(response.text)
         results = parser.results[:max_results]
         if not results:
@@ -562,18 +586,18 @@ def set_volume(level: int):
         return f"Lautstärke {level}%"
     except: return "Fehler"
 
-def open_app(app_name: str):
+def open_app(absolute_app_path: str):
     try:
-        if "win" in os.sys.platform: subprocess.Popen(["start", app_name], shell=True)
-        else: subprocess.Popen([app_name])
-        return f"Öffne {app_name}"
+        if "win" in os.sys.platform: subprocess.Popen(["start", absolute_app_path], shell=True)
+        else: subprocess.Popen([absolute_app_path])
+        return f"Öffne {absolute_app_path}"
     except: return "Fehler"
 
 def get_time(): return time.strftime("Es ist %H:%M am %d.%m.%Y")
 
 static_tools = [
     {"type": "function", "function": {"name": "set_volume", "description": "PC Lautstärke", "parameters": {"type": "object", "properties": {"level": {"type": "integer"}}, "required": ["level"]}}},
-    {"type": "function", "function": {"name": "open_app", "description": "Programm öffnen", "parameters": {"type": "object", "properties": {"app_name": {"type": "string"}}, "required": ["app_name"]}}},
+    {"type": "function", "function": {"name": "open_app", "description": "Programm öffnen", "parameters": {"type": "object", "properties": {"absolute_app_path": {"type": "string"}}, "required": ["absolute_app_path"]}}},
     {"type": "function", "function": {"name": "get_time", "description": "Uhrzeit", "parameters": {"type": "object", "properties": {}}}}
 ]
 
@@ -633,7 +657,16 @@ def select_models(text):
         f"{json.dumps(available_tasks, ensure_ascii=True)}. "
     )
     decision_errors = []
-    for decision_model in decision_candidates:
+    decision_candidates = [
+        model for model in decision_candidates
+        if model.endswith(":free") and model not in UNAVAILABLE_FREE_MODELS
+    ]
+    attempted_decision_models = set()
+    while decision_candidates:
+        decision_model = decision_candidates.pop(0)
+        if decision_model in attempted_decision_models:
+            continue
+        attempted_decision_models.add(decision_model)
         try:
             response = client.chat.completions.create(
                 model=decision_model,
@@ -658,6 +691,14 @@ def select_models(text):
                 return selected_models
         except Exception as error:
             decision_errors.append(f"{decision_model}: {error}")
+            if is_free_model_unavailable_error(error):
+                evict_unavailable_free_model(decision_model)
+                with MODEL_CATALOG_LOCK:
+                    decision_candidates.extend(
+                        candidate for candidate in DECISION_MODELS + DECISION_MODELS_BACKUP
+                        if candidate not in attempted_decision_models
+                        and candidate not in UNAVAILABLE_FREE_MODELS
+                    )
 
     if decision_errors:
         print(f"[DECISION] AI classification unavailable; using backup router ({'; '.join(decision_errors)})")
@@ -756,27 +797,45 @@ def chat_with_fallback(messages, model_list=None):
     candidates = list(model_list or [])
     candidates.extend(model for model in MODELS if model not in candidates)
     last_error = None
-    for model in order_models_by_latency(candidates):
+    attempted_models = set()
+    while True:
+        candidates = [
+            model for model in candidates
+            if model.endswith(":free") and model not in UNAVAILABLE_FREE_MODELS
+            and model not in attempted_models
+        ]
+        if not candidates:
+            break
+        model = order_models_by_latency(candidates)[0]
+        attempted_models.add(model)
         started = time.perf_counter()
         try:
             res = client.chat.completions.create(model=model, messages=messages, tools=current_tools, tool_choice="auto", max_tokens=500)
+            choices = getattr(res, "choices", None)
+            if not choices or getattr(choices[0], "message", None) is None:
+                raise ValueError(f"Model {model} returned no completion choices")
             record_model_latency(model, time.perf_counter() - started)
             return res, model
         except Exception as error:
             last_error = error
+            if is_free_model_unavailable_error(error):
+                evict_unavailable_free_model(model)
+                candidates.extend(candidate for candidate in MODELS if candidate not in candidates)
             continue
     raise Exception(f"Kein Modell verfügbar: {last_error}")
 
 def summarize_conversation(history):
     res, _ = chat_with_fallback(history + [{"role": "user", "content": "Fasse in 4 Sätzen zusammen."}])
-    return res.choices[0].message.content
+    return res.choices[0].message.content or ""
 
 def ask_ai(text):
     global conversation_history, summary
     model_list = select_models(text)
     conversation_history.append({"role": "user", "content": text})
     if len(conversation_history) > 10:
-        summary = summary + "\n" + summarize_conversation(conversation_history[1:-8]) if summary else summarize_conversation(conversation_history[1:-8])
+        new_summary = summarize_conversation(conversation_history[1:-8]).strip()
+        if new_summary:
+            summary = f"{summary}\n{new_summary}" if summary else new_summary
         conversation_history = [conversation_history[0]] + conversation_history[-8:]; save_memory()
 
     response, _ = chat_with_fallback(conversation_history, model_list)
@@ -784,10 +843,22 @@ def ask_ai(text):
     if msg.tool_calls:
         conversation_history.append(msg.model_dump(exclude_none=True))
         for tc in msg.tool_calls:
-            result = globals()[tc.function.name](**json.loads(tc.function.arguments))
+            tool_name = getattr(tc.function, "name", None)
+            tool_function = globals().get(tool_name)
+            if tool_function is None:
+                result = f"Unbekanntes Tool: {tool_name}"
+            else:
+                raw_arguments = getattr(tc.function, "arguments", None) or "{}"
+                try:
+                    arguments = json.loads(raw_arguments)
+                    if not isinstance(arguments, dict):
+                        raise ValueError("Tool-Argumente müssen ein JSON-Objekt sein.")
+                    result = tool_function(**arguments)
+                except (json.JSONDecodeError, TypeError, ValueError) as error:
+                    result = f"Ungültige Argumente für {tool_name}: {error}"
             conversation_history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-        final, _ = chat_with_fallback(conversation_history, model_list); ai_message = final.choices[0].message.content
-    else: ai_message = msg.content
+        final, _ = chat_with_fallback(conversation_history, model_list); ai_message = final.choices[0].message.content or ""
+    else: ai_message = msg.content or ""
     conversation_history.append({"role": "assistant", "content": ai_message}); save_memory(); return ai_message
 
 # ========= 5. SPEECH LOOP =========
@@ -865,7 +936,7 @@ if __name__ == "__main__":
                     answer = ask_ai(user_text)
                     print(f"Jarvis: {answer}")
                     speak(answer)
-
+                    
             finally:
                 prediction = {}
                 oww.reset()
