@@ -1,6 +1,6 @@
 🤖 Project Jarvis
 
-> A local voice-controlled AI assistant for PC, Home Assistant and Minecraft.
+> A voice-controlled AI assistant for PC, Home Assistant and Minecraft.
 
 Project Jarvis is a Python-based personal AI assistant designed to combine
 natural voice interaction with AI-powered task routing and real-world
