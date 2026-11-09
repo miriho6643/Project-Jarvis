@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 from openai import OpenAI
-import os, json, re, threading, time, subprocess, requests
+import os, json, re, threading, time, subprocess, requests, zipfile
 from html.parser import HTMLParser
 from urllib.parse import urlencode
 import numpy as np
@@ -9,16 +9,161 @@ import openwakeword
 import sounddevice as sd
 from piper import PiperVoice
 from mcrcon import MCRcon # pip install mcrcon
+from language_catalog import LANGUAGE_CATALOG
 
 
 # ========= 1. SETUP =========
 load_dotenv()
 
+LANGUAGE_NAMES = {code: details["name"] for code, details in LANGUAGE_CATALOG.items()}
+LANGUAGE_LOCALES = {code: details["locale"] for code, details in LANGUAGE_CATALOG.items()}
+VOSK_MODEL_NAMES = {code: details["vosk_model"] for code, details in LANGUAGE_CATALOG.items()}
+PIPER_MODEL_NAMES = {code: details["piper_path"].rsplit("/", 1)[-1] for code, details in LANGUAGE_CATALOG.items()}
+VOSK_MODEL_URLS = {
+    code: f"https://alphacephei.com/vosk/models/{details['vosk_model']}.zip"
+    for code, details in LANGUAGE_CATALOG.items()
+}
+PIPER_REPO_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+PIPER_VOICE_URLS = {
+    code: [PIPER_REPO_BASE + details["piper_path"]]
+    for code, details in LANGUAGE_CATALOG.items()
+}
+PIPER_VOICE_JSON_URLS = {
+    code: [PIPER_REPO_BASE + details["piper_path"] + ".json"]
+    for code, details in LANGUAGE_CATALOG.items()
+}
+configured_languages = tuple(dict.fromkeys(
+    language.strip().lower()
+    for language in os.getenv("LANGUAGES", "de,en").split(",")
+    if language.strip()
+))
+SUPPORTED_LANGUAGES = tuple(LANGUAGE_CATALOG) if "all" in configured_languages else configured_languages
+if not SUPPORTED_LANGUAGES or any(language not in LANGUAGE_NAMES for language in SUPPORTED_LANGUAGES):
+    raise ValueError(f"LANGUAGES must be 'all' or codes from: {', '.join(LANGUAGE_NAMES)}")
+DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "de").strip().lower()
+if DEFAULT_LANGUAGE not in SUPPORTED_LANGUAGES:
+    raise ValueError("DEFAULT_LANGUAGE must be included in LANGUAGES")
+AUTO_LANGUAGE_SWITCH_DEFAULT = os.getenv("AUTO_LANGUAGE_SWITCH", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+OFFLINE = os.getenv("OFFLINE_MODE", os.getenv("OFFLINE", "false")).strip().lower() == "true"
+AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama" if OFFLINE else "openrouter").strip().lower()
+if AI_PROVIDER not in {"ollama", "openrouter"}:
+    raise ValueError("AI_PROVIDER must be 'ollama' or 'openrouter'")
+
+AUTO_INSTALL_ASSETS = os.getenv("AUTO_INSTALL_ASSETS", "true").strip().lower() == "true"
+FAST_MODE = os.getenv("FAST_MODE", "true").strip().lower() == "true"
+LISTEN_TIMEOUT = max(5, min(int(os.getenv("LISTEN_TIMEOUT", "12")), 20))
+LISTEN_PHRASE_LIMIT = max(4, min(int(os.getenv("LISTEN_PHRASE_LIMIT", "8")), 15))
+
+OFFLINE = AI_PROVIDER == "ollama"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    default_headers={"HTTP-Referer": "http://localhost", "X-Title": "Jarvis Voice"}
+    base_url=(
+        os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        if OFFLINE else os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1")
+    ),
+    api_key=(
+        os.getenv("OLLAMA_API_KEY", "ollama")
+        if OFFLINE else os.getenv("AI_API_KEY")
+    ),
+    default_headers=(
+        None if OFFLINE else {"HTTP-Referer": "http://localhost", "X-Title": "Jarvis Voice"}
+    )
 )
+
+def create_chat_completion(**kwargs):
+    if OFFLINE:
+        extra_body = dict(kwargs.get("extra_body") or {})
+        extra_body.setdefault("reasoning_effort", "none")
+        kwargs["extra_body"] = extra_body
+    return client.chat.completions.create(**kwargs)
+
+LANGUAGE_MARKERS = {
+    "de": {"aber", "an", "bitte", "danke", "das", "der", "die", "du", "ein", "eine", "er", "es", "hallo", "heute", "ich", "ihr", "ist", "ja", "kann", "licht", "mach", "nein", "nicht", "oder", "schalte", "sie", "sind", "und", "warum", "was", "wie", "wir", "wo", "zeit"},
+    "en": {"a", "an", "and", "are", "but", "can", "could", "did", "do", "does", "for", "have", "has", "hello", "how", "i", "is", "it", "light", "me", "my", "no", "not", "of", "off", "on", "open", "or", "please", "she", "the", "they", "time", "today", "to", "turn", "we", "what", "when", "where", "who", "why", "with", "would", "yes", "you"},
+    "pl": {"ale", "co", "czy", "dlaczego", "do", "dzień", "gdzie", "i", "jak", "jest", "mam", "na", "nie", "proszę", "przełącz", "tak", "to", "w", "z", "cześć", "światło"},
+    "ru": {"а", "без", "быть", "в", "вы", "где", "да", "для", "до", "и", "как", "когда", "кто", "мне", "мы", "на", "не", "нет", "но", "он", "она", "они", "открой", "переключи", "пожалуйста", "почему", "привет", "свет", "что", "это", "я"},
+    "it": {"a", "al", "anche", "che", "chi", "ciao", "come", "con", "da", "dove", "e", "è", "il", "in", "io", "la", "ma", "mi", "no", "non", "oggi", "per", "perché", "prego", "sì", "sono", "un", "una"}
+}
+ENTITY_HINTS = {
+    "de": {
+        "names": {"alex", "anna", "ben", "emma", "leo", "lisa", "max", "mia", "noah", "sarah", "tom", "julian", "maria", "paul", "daniel", "lucas", "mia", "hannah", "jonas", "felix", "sophie"},
+        "food": {"pizza", "kebab", "pasta", "brot", "kaffee", "bier", "suppe", "salat", "nudeln", "reis", "apfel", "obst", "käse", "torte", "burger", "reis", "curry", "schokolade", "tee"},
+        "games": {"minecraft", "fortnite", "csgo", "valorant", "league", "overwatch", "rocketleague", "starcraft", "terraria", "thexis", "zelda", "pokemon", "gta", "fifa", "apex", "counterstrike", "dota"}
+    },
+    "en": {
+        "names": {"alex", "anna", "ben", "emma", "leo", "lisa", "max", "mia", "noah", "sarah", "tom", "julia", "maria", "paul", "daniel", "lucas", "hannah", "jonas", "felix", "sophie", "michael", "daniel", "thomas", "olivia", "charlie"},
+        "food": {"pizza", "kebab", "pasta", "bread", "coffee", "beer", "soup", "salad", "noodles", "rice", "apple", "fruit", "cheese", "cake", "burger", "curry", "chocolate", "tea", "steak", "lasagna"},
+        "games": {"minecraft", "fortnite", "csgo", "valorant", "league", "overwatch", "rocketleague", "starcraft", "terraria", "zelda", "pokemon", "gta", "fifa", "apex", "counterstrike", "dota", "halo"}
+    },
+    "pl": {
+        "names": {"aleks", "anna", "jan", "jakub", "katarzyna", "maja", "maria", "piotr"},
+        "food": {"barszcz", "chleb", "kawa", "pierogi", "pizza", "ser", "zupa"},
+        "games": {"minecraft", "fortnite", "gta", "pokemon", "valorant"}
+    },
+    "ru": {
+        "names": {"алексей", "анна", "иван", "мария", "михаил", "саша"},
+        "food": {"борщ", "кофе", "пицца", "хлеб", "сыр"},
+        "games": {"майнкрафт", "minecraft", "fortnite", "gta", "pokemon"}
+    },
+    "it": {
+        "names": {"alessandro", "anna", "giulia", "giuseppe", "luca", "marco", "maria"},
+        "food": {"caffè", "formaggio", "pane", "pasta", "pizza", "risotto"},
+        "games": {"minecraft", "fortnite", "gta", "pokemon", "valorant"}
+    }
+}
+
+def language_scores(text):
+    scores = {language: 0 for language in SUPPORTED_LANGUAGES}
+    normalized = re.findall(r"[^\W\d_]+", text.casefold(), re.UNICODE)
+    for word in normalized:
+        for language in SUPPORTED_LANGUAGES:
+            if word in LANGUAGE_MARKERS.get(language, set()):
+                scores[language] += 1
+            hints = ENTITY_HINTS.get(language, {})
+            if word in hints.get("names", set()):
+                scores[language] += 3
+            if word in hints.get("food", set()):
+                scores[language] += 3
+            if word in hints.get("games", set()):
+                scores[language] += 3
+    if "de" in scores and re.search(r"[äöüß]", text.casefold()):
+        scores["de"] += 2
+    return scores
+
+def detect_language(text, fallback=None):
+    fallback = fallback if fallback in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+    scores = language_scores(text)
+    best_score = max(scores.values(), default=0)
+    best_languages = [language for language, score in scores.items() if score == best_score]
+    return best_languages[0] if best_score and len(best_languages) == 1 else fallback
+
+def choose_transcript(candidates, fallback_language=None):
+    if not candidates:
+        return "", DEFAULT_LANGUAGE
+    scored = [
+        (language_scores(text).get(language, 0), confidence, language, text)
+        for language, text, confidence in candidates
+    ]
+    best_score = max((score, confidence) for score, confidence, _, _ in scored)
+    best = [candidate for candidate in scored if candidate[:2] == best_score]
+    preferred_language = fallback_language if fallback_language in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+    selected = next((candidate for candidate in best if candidate[2] == preferred_language), best[0])
+    return selected[3], selected[2]
+
+def build_system_prompt(language):
+    prompts = {
+        "de": "Du bist Jarvis und antwortest ausschließlich auf Deutsch, ohne Formatierungen, Listen oder Emojis. Nutze die bereitgestellten Funktionen für Aktionen, statt deren Ergebnisse zu erfinden oder ihren Namen im Text zu nennen. Home Assistant über die passende Gerätefunktion mit do/with, Minecraft über minecraft_command, aktuelle Websuche über web_search, lokale Uhrzeit über get_time und terminal_command nur für ausdrücklich gewünschte lokale Befehle. Bei einem gewünschten Sprachwechsel rufe switch_language auf; für die automatische Spracherkennung nutze set_auto_language_switch. Wenn du eine Rückfrage stellst oder der Nutzer eine Folgefrage ankündigt, rufe keep_listening direkt auf und schreibe den Tool-Namen niemals als Text an den Nutzer.",
+        "en": "You are Jarvis. Always reply only in English, with no formatting, lists, or emojis. Use the provided tools for actions instead of inventing results or naming tool functions in plain text. Use the matching Home Assistant device function with do/with, minecraft_command for Minecraft, web_search for current information, get_time for the local time, and terminal_command only for explicitly requested local actions. For a requested language change, call switch_language; use set_auto_language_switch to enable or disable automatic language detection. If you ask a follow-up question or the user announces one, call keep_listening directly and never write the tool name as user-facing text.",
+        "pl": "Jesteś Jarvisem. Odpowiadaj wyłącznie po polsku. Korzystaj z dostępnych narzędzi, aby wykonywać działania, zamiast opisywać ich nazwy. Na prośbę o zmianę języka wywołaj switch_language, a aby włączyć lub wyłączyć automatyczne rozpoznawanie języka, użyj set_auto_language_switch. Na pytania uzupełniające odpowiadaj po polsku.",
+        "ru": "Ты Jarvis. Отвечай только по-русски. Используй доступные инструменты для выполнения действий, не называй их пользователю. Для смены языка вызывай switch_language, а для включения или отключения автоматического определения языка используй set_auto_language_switch. На уточняющие вопросы отвечай по-русски.",
+        "it": "Sei Jarvis. Rispondi esclusivamente in italiano. Usa gli strumenti disponibili per eseguire le azioni, senza mostrarne i nomi all'utente. Per cambiare lingua chiama switch_language; per attivare o disattivare il rilevamento automatico della lingua usa set_auto_language_switch. Rispondi in italiano anche alle domande di approfondimento."
+    }
+    return prompts.get(
+        language,
+        f"You are Jarvis. Reply only in {LANGUAGE_NAMES[language]} ({language}). Use available tools to perform actions and do not mention tool names to the user."
+    )
+
 MODELS = [
     "nvidia/nemotron-3.5-lightning:free",
     "minimax/minimax-m3:free",
@@ -72,6 +217,19 @@ MODEL_BASED_BACKUP = {
     group: {task: model_ids.copy() for task, model_ids in tasks.items()}
     for group, tasks in MODEL_BASED.items()
 }
+if OFFLINE:
+    MODELS = [OLLAMA_MODEL]
+    DECISION_MODEL = OLLAMA_MODEL
+    DECISION_MODELS = [OLLAMA_MODEL]
+    DECISION_MODELS_BACKUP = [OLLAMA_MODEL]
+    MODEL_BASED = {
+        group: {task: [OLLAMA_MODEL] for task in tasks}
+        for group, tasks in MODEL_BASED.items()
+    }
+    MODEL_BASED_BACKUP = {
+        group: {task: model_ids.copy() for task, model_ids in tasks.items()}
+        for group, tasks in MODEL_BASED.items()
+    }
 
 MODEL_CATALOG_LOCK = threading.RLock()
 UNAVAILABLE_FREE_MODELS = set()
@@ -217,10 +375,10 @@ def model_catalog_refresher():
     while True:
         refresh_model_decision_list()
         time.sleep(3600)
-
-# Replace stale baked-in IDs before Jarvis can route its first request.
-refresh_model_decision_list()
-threading.Thread(target=model_catalog_refresher, daemon=True).start()
+if AI_PROVIDER == "openrouter":
+    # Replace stale baked-in IDs before Jarvis can route its first request.
+    refresh_model_decision_list()
+    threading.Thread(target=model_catalog_refresher, daemon=True).start()
 
 def order_models_by_latency(model_list):
     """Put measured fastest models first while preserving unknown model order."""
@@ -252,19 +410,127 @@ MIC_ARGS = {"sample_rate": 16000, "chunk_size": 1280, "device_index": 1} # Mikro
 tools = []
 device_lock = threading.Lock()
 keep_listening_event = threading.Event()
-openwakeword.utils.download_models()
+if not OFFLINE:
+    openwakeword.utils.download_models()
 
-DEFAULT_HISTORY = [{"role": "system", "content": "Du bist Jarvis. Steuere Geräte mit do/with. Für Minecraft nutze minecraft_command. Du darfst keine Formatierungen Listen oder Emojis nutzen da du auf Sprache antwortest. Nutze nur die Sprache Deutsch und keine andere Sprache. Gib ausnahmslos eine Antwort wieder. Sobald du eine Frage stellst, nutze den Keep Listening Command um den User antworten zu lassen."}]
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+VOICES_DIR = os.path.join(PROJECT_ROOT, "voices")
+
+def download_file(url, destination, timeout=60):
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    response = requests.get(url, timeout=timeout, stream=True)
+    response.raise_for_status()
+    with open(destination, "wb") as file:
+        for chunk in response.iter_content(chunk_size=65536):
+            if chunk:
+                file.write(chunk)
+    return destination
+
+
+def download_first_available(urls, destination, timeout=60):
+    candidates = urls if isinstance(urls, (list, tuple)) else [urls]
+    last_error = None
+    for url in candidates:
+        try:
+            return download_file(url, destination, timeout=timeout)
+        except requests.RequestException as error:
+            last_error = error
+            print(f"[ASSET] Download failed for {url}; trying next mirror if available.")
+    if last_error is not None:
+        raise last_error
+    raise requests.RequestException(f"No valid download URL available for {destination}")
+
+
+def ensure_vosk_model(language):
+    language = language.strip().lower()
+    if language not in VOSK_MODEL_URLS:
+        raise ValueError(f"Unsupported Vosk language: {language}")
+
+    target_dir = resolve_vosk_model_path(language)
+
+    if os.path.isdir(target_dir) and os.path.isfile(os.path.join(target_dir, "am", "final.mdl")):
+        return target_dir
+
+    if not AUTO_INSTALL_ASSETS:
+        raise FileNotFoundError(f"Vosk model for {language} not found: {target_dir}")
+
+    print(f"[ASSET] Downloading Vosk model for {language} to {target_dir}...")
+    archive_path = os.path.join(MODELS_DIR, f"{VOSK_MODEL_NAMES[language]}.zip")
+    download_file(VOSK_MODEL_URLS[language], archive_path)
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        archive.extractall(MODELS_DIR)
+    if os.path.isdir(target_dir):
+        return target_dir
+    extracted_dir = os.path.join(MODELS_DIR, VOSK_MODEL_NAMES[language])
+    if os.path.isdir(extracted_dir):
+        return extracted_dir
+    raise FileNotFoundError(f"Vosk model extraction failed for {language}: {target_dir}")
+
+
+def resolve_vosk_model_path(language):
+    model_path = os.getenv(f"VOSK_MODEL_PATH_{language.upper()}")
+    if not model_path and language == DEFAULT_LANGUAGE:
+        model_path = os.getenv("VOSK_MODEL_PATH")
+    if not model_path:
+        model_path = os.path.join(MODELS_DIR, VOSK_MODEL_NAMES[language])
+    if not os.path.isabs(model_path):
+        model_path = os.path.join(PROJECT_ROOT, model_path)
+    return model_path
+
+
+def ensure_piper_voice(language):
+    language = language.strip().lower()
+    if language not in PIPER_VOICE_URLS:
+        raise ValueError(f"Unsupported Piper language: {language}")
+
+    model_name = PIPER_MODEL_NAMES[language]
+    target_path = os.getenv(f"PIPER_MODEL_PATH_{language.upper()}")
+    if not target_path:
+        target_path = os.path.join(VOICES_DIR, model_name)
+    if not os.path.isabs(target_path):
+        target_path = os.path.join(PROJECT_ROOT, target_path)
+
+    json_path = target_path + ".json"
+    if os.path.isfile(target_path) and os.path.isfile(json_path):
+        return target_path
+
+    if not AUTO_INSTALL_ASSETS:
+        raise FileNotFoundError(f"Piper voice for {language} not found: {target_path}")
+
+    print(f"[ASSET] Downloading Piper voice for {language} to {target_path}...")
+    try:
+        download_first_available(PIPER_VOICE_URLS[language], target_path)
+        if not os.path.exists(json_path):
+            download_first_available(PIPER_VOICE_JSON_URLS[language], json_path)
+        return target_path
+    except requests.RequestException as error:
+        print(f"[ASSET] Piper voice for {language} could not be downloaded; keeping local files as-is. ({error})")
+        return target_path if os.path.isfile(target_path) else None
+
+
+def ensure_local_assets():
+    ensure_vosk_model(current_language)
+    ensure_piper_voice(current_language)
+
+
+DEFAULT_HISTORY = [{"role": "system", "content": build_system_prompt(DEFAULT_LANGUAGE)}]
 
 # Memory
 conversation_history = DEFAULT_HISTORY.copy()
 summary = ""
+current_language = DEFAULT_LANGUAGE
+auto_language_switch = AUTO_LANGUAGE_SWITCH_DEFAULT
 if os.path.exists(MEMORY_FILE):
     try:
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         conversation_history = data.get("history", DEFAULT_HISTORY)
         summary = data.get("summary", "")
+        current_language = data.get("language", DEFAULT_LANGUAGE)
+        if current_language not in SUPPORTED_LANGUAGES:
+            current_language = DEFAULT_LANGUAGE
+        auto_language_switch = data.get("auto_language_switch", AUTO_LANGUAGE_SWITCH_DEFAULT)
     except (OSError, json.JSONDecodeError) as error:
         backup_file = MEMORY_FILE + ".corrupt"
         try:
@@ -275,16 +541,49 @@ if os.path.exists(MEMORY_FILE):
 
 def save_memory():
     temporary_file = MEMORY_FILE + ".tmp"
+    payload = {
+        "history": conversation_history,
+        "summary": summary,
+        "language": current_language,
+        "auto_language_switch": auto_language_switch,
+    }
     with open(temporary_file, "w", encoding="utf-8") as f:
-        json.dump({"history": conversation_history, "summary": summary}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(temporary_file, MEMORY_FILE)
 
 # TTS
-TTS_MODEL_PATH = os.path.join(os.path.dirname(__file__), "voices", "de_DE-thorsten-medium.onnx")
-tts_voice = PiperVoice.load(TTS_MODEL_PATH)
+ensure_local_assets()
+TTS_MODEL_PATHS = {
+    language: os.getenv(
+        f"PIPER_MODEL_PATH_{language.upper()}",
+        os.path.join(os.path.dirname(__file__), "voices", PIPER_MODEL_NAMES[language])
+    )
+    for language in SUPPORTED_LANGUAGES
+}
+tts_voices = {}
+for language, path in TTS_MODEL_PATHS.items():
+    if not os.path.isfile(path):
+        print(f"[TTS] No {LANGUAGE_NAMES[language]} voice at {path}; using a fallback only if available.")
+        continue
+    try:
+        tts_voices[language] = PiperVoice.load(path)
+        print(f"[TTS] Loaded {LANGUAGE_NAMES[language]} voice: {path}")
+    except Exception as error:
+        print(f"[TTS] Could not load {LANGUAGE_NAMES[language]} voice at {path}: {error}")
+
+if DEFAULT_LANGUAGE not in tts_voices:
+    print(f"[TTS] No valid Piper voice for default language {LANGUAGE_NAMES[DEFAULT_LANGUAGE]} in {TTS_MODEL_PATHS[DEFAULT_LANGUAGE]}; speech output is disabled until a valid voice is present.")
+
 tts_lock = threading.Lock()
 
-def speak(text):
+def speak(text, language=None):
+    if not text or not tts_voices:
+        return
+    language = language if language in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+    tts_voice = tts_voices.get(language, next(iter(tts_voices.values()), None))
+    if tts_voice is None:
+        return
+
     def synthesize_and_play():
         try:
             with tts_lock:
@@ -449,7 +748,9 @@ web_terminal_tools = [
             "description": (
                 "Führt einen lokalen Terminal- oder Shell-Befehl auf dem "
                 "Computer aus. Nutze es für lokale Dateien, Programme, "
-                "Systeminformationen, Python-Befehle und andere Shell-Aufgaben."
+                "Systeminformationen, Python-Befehle und andere Shell-Aufgaben. "
+                "Öffne Windows-Programme mit start \"\" <Programmname> oder "
+                "start \"\" \"<vollständiger EXE-Pfad>\"."
             ),
             "parameters": {
                 "type": "object",
@@ -564,7 +865,7 @@ def generate_ha_tools():
     try:
 
         # Statische PC + MC Tools
-        ha_functions.update({"set_volume": set_volume, "open_app": open_app, "get_time": get_time, "minecraft_command": minecraft_command, "keep_listening": keep_listening})
+        ha_functions.update({"set_volume": set_volume, "get_time": get_time, "minecraft_command": minecraft_command, "keep_listening": keep_listening})
         new_tools.extend(static_tools)
         new_tools.append({"type": "function", "function": {"name": "minecraft_command", "description": "Führt einen Befehl auf dem Minecraft Server aus. Nutze Minecraft Syntax ohne /", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Bsp: gamemode creative @p"}}, "required": ["command"]}}})
 
@@ -586,19 +887,62 @@ def set_volume(level: int):
         return f"Lautstärke {level}%"
     except: return "Fehler"
 
-def open_app(absolute_app_path: str):
-    try:
-        if "win" in os.sys.platform: subprocess.Popen(["start", absolute_app_path], shell=True)
-        else: subprocess.Popen([absolute_app_path])
-        return f"Öffne {absolute_app_path}"
-    except: return "Fehler"
-
 def get_time(): return time.strftime("Es ist %H:%M am %d.%m.%Y")
+
+def switch_language(language: str):
+    language = str(language).strip().lower()
+    if language not in SUPPORTED_LANGUAGES:
+        return f"Sprache nicht verfügbar: {language}. Verfügbar: {', '.join(SUPPORTED_LANGUAGES)}"
+    global current_language
+    try:
+        ensure_vosk_model(language)
+        voice_path = ensure_piper_voice(language)
+        if voice_path:
+            tts_voices[language] = PiperVoice.load(voice_path)
+    except Exception as error:
+        return f"Could not load {LANGUAGE_NAMES[language]} speech models: {error}"
+    current_language = language
+    system_message = {"role": "system", "content": build_system_prompt(current_language)}
+    if conversation_history:
+        conversation_history[0] = system_message
+    else:
+        conversation_history.append(system_message)
+    save_memory()
+    return {
+        "de": f"Sprache auf {LANGUAGE_NAMES[current_language]} gesetzt.",
+        "en": f"Language switched to {LANGUAGE_NAMES[current_language]}.",
+        "pl": f"Język zmieniono na {LANGUAGE_NAMES[current_language]}.",
+        "ru": f"Язык переключён на {LANGUAGE_NAMES[current_language]}.",
+        "it": f"Lingua cambiata in {LANGUAGE_NAMES[current_language]}.",
+    }.get(current_language, f"Language switched to {LANGUAGE_NAMES[current_language]}.")
+
+
+def set_auto_language_switch(enabled: bool):
+    global auto_language_switch
+    if isinstance(enabled, str):
+        normalized = enabled.strip().lower()
+        if normalized not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+            return "Ungültiger Wert. Verwende true oder false." if current_language == "de" else "Invalid value. Use true or false."
+        enabled = normalized in {"true", "1", "yes", "on"}
+    elif not isinstance(enabled, bool):
+        return "Ungültiger Wert. Verwende true oder false." if current_language == "de" else "Invalid value. Use true or false."
+
+    auto_language_switch = enabled
+    save_memory()
+    status_messages = {
+        "de": ("Automatischer Sprachwechsel aktiviert.", "Automatischer Sprachwechsel deaktiviert."),
+        "en": ("Automatic language switching enabled.", "Automatic language switching disabled."),
+        "pl": ("Automatyczne przełączanie języka włączone.", "Automatyczne przełączanie języka wyłączone."),
+        "ru": ("Автоматическое переключение языка включено.", "Автоматическое переключение языка выключено."),
+        "it": ("Rilevamento automatico della lingua attivato.", "Rilevamento automatico della lingua disattivato."),
+    }
+    return status_messages[current_language][0 if enabled else 1]
 
 static_tools = [
     {"type": "function", "function": {"name": "set_volume", "description": "PC Lautstärke", "parameters": {"type": "object", "properties": {"level": {"type": "integer"}}, "required": ["level"]}}},
-    {"type": "function", "function": {"name": "open_app", "description": "Programm öffnen", "parameters": {"type": "object", "properties": {"absolute_app_path": {"type": "string"}}, "required": ["absolute_app_path"]}}},
-    {"type": "function", "function": {"name": "get_time", "description": "Uhrzeit", "parameters": {"type": "object", "properties": {}}}}
+    {"type": "function", "function": {"name": "get_time", "description": "Gibt die aktuelle lokale Uhrzeit und das Datum zurück. Verwende diese Funktion, wenn der Nutzer nach Uhrzeit oder Datum fragt.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "switch_language", "description": "Wechselt sofort Jarvis' Antwort- und Sprachausgabesprache. Verwende dieses Tool, wenn der Nutzer ausdrücklich die Sprache wechseln möchte. Die Auswahl wird gespeichert.", "parameters": {"type": "object", "properties": {"language": {"type": "string", "enum": list(SUPPORTED_LANGUAGES), "description": "Zielsprache"}}, "required": ["language"]}}},
+    {"type": "function", "function": {"name": "set_auto_language_switch", "description": "Aktiviert oder deaktiviert die automatische Erkennung und Umschaltung der Sprache anhand der Nutzereingabe. Die Einstellung wird gespeichert.", "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean", "description": "true zum Aktivieren, false zum Deaktivieren"}}, "required": ["enabled"]}}}
 ]
 
 # ========= 4. CORE KI LOGIK =========
@@ -644,6 +988,26 @@ TASK_KEYWORDS = {
 
 def select_models(text):
     """Use a free AI model to select the ranked models for the user's request."""
+    normalized = text.casefold()
+    scores = []
+    for group, tasks in TASK_KEYWORDS.items():
+        for task, keywords in tasks.items():
+            score = sum(1 for keyword in keywords if keyword.casefold() in normalized)
+            if score:
+                scores.append((score, group, task))
+
+    if not scores:
+        group, task = "General", "Conversation"
+    else:
+        _, group, task = max(scores, key=lambda match: match[0])
+
+    with MODEL_CATALOG_LOCK:
+        configured_models = MODEL_BASED[group][task][:3]
+    selected_models = order_models_by_latency(configured_models)
+    if OFFLINE or not FAST_MODE:
+        print(f"[ROUTER] {group} / {task}: {', '.join(selected_models)}")
+        return selected_models
+
     with MODEL_CATALOG_LOCK:
         available_tasks = {
             group: list(tasks.keys()) for group, tasks in MODEL_BASED.items()
@@ -657,10 +1021,11 @@ def select_models(text):
         f"{json.dumps(available_tasks, ensure_ascii=True)}. "
     )
     decision_errors = []
-    decision_candidates = [
-        model for model in decision_candidates
-        if model.endswith(":free") and model not in UNAVAILABLE_FREE_MODELS
-    ]
+    if AI_PROVIDER == "openrouter":
+        decision_candidates = [
+            model for model in decision_candidates
+            if model.endswith(":free") and model not in UNAVAILABLE_FREE_MODELS
+        ]
     attempted_decision_models = set()
     while decision_candidates:
         decision_model = decision_candidates.pop(0)
@@ -668,7 +1033,7 @@ def select_models(text):
             continue
         attempted_decision_models.add(decision_model)
         try:
-            response = client.chat.completions.create(
+            response = create_chat_completion(
                 model=decision_model,
                 messages=[
                     {"role": "system", "content": decision_prompt},
@@ -702,24 +1067,6 @@ def select_models(text):
 
     if decision_errors:
         print(f"[DECISION] AI classification unavailable; using backup router ({'; '.join(decision_errors)})")
-
-    # Keep the assistant usable when the decision model is unavailable.
-    normalized = text.casefold()
-    scores = []
-    for group, tasks in TASK_KEYWORDS.items():
-        for task, keywords in tasks.items():
-            score = sum(1 for keyword in keywords if keyword.casefold() in normalized)
-            if score:
-                scores.append((score, group, task))
-
-    if not scores:
-        group, task = "General", "Conversation"
-    else:
-        _, group, task = max(scores, key=lambda match: match[0])
-
-    with MODEL_CATALOG_LOCK:
-        configured_models = MODEL_BASED[group][task][:3]
-    selected_models = order_models_by_latency(configured_models)
     print(f"[ROUTER] {group} / {task}: {', '.join(selected_models)}")
     return selected_models
 
@@ -801,8 +1148,9 @@ def chat_with_fallback(messages, model_list=None):
     while True:
         candidates = [
             model for model in candidates
-            if model.endswith(":free") and model not in UNAVAILABLE_FREE_MODELS
-            and model not in attempted_models
+            if (AI_PROVIDER == "ollama" or (
+                model.endswith(":free") and model not in UNAVAILABLE_FREE_MODELS
+            )) and model not in attempted_models
         ]
         if not candidates:
             break
@@ -810,10 +1158,14 @@ def chat_with_fallback(messages, model_list=None):
         attempted_models.add(model)
         started = time.perf_counter()
         try:
-            res = client.chat.completions.create(model=model, messages=messages, tools=current_tools, tool_choice="auto", max_tokens=500)
+            res = create_chat_completion(model=model, messages=messages, tools=current_tools, tool_choice="auto", max_tokens=500)
             choices = getattr(res, "choices", None)
             if not choices or getattr(choices[0], "message", None) is None:
                 raise ValueError(f"Model {model} returned no completion choices")
+            message = choices[0].message
+            if not message.content and not message.tool_calls:
+                finish_reason = getattr(choices[0], "finish_reason", None)
+                raise ValueError(f"Model {model} returned empty content (finish_reason={finish_reason})")
             record_model_latency(model, time.perf_counter() - started)
             return res, model
         except Exception as error:
@@ -824,64 +1176,163 @@ def chat_with_fallback(messages, model_list=None):
             continue
     raise Exception(f"Kein Modell verfügbar: {last_error}")
 
-def summarize_conversation(history):
-    res, _ = chat_with_fallback(history + [{"role": "user", "content": "Fasse in 4 Sätzen zusammen."}])
+def summarize_conversation(history, language):
+    prompt = "Summarize in four sentences." if language == "en" else "Fasse in vier Sätzen zusammen."
+    res, _ = chat_with_fallback(history + [{"role": "user", "content": prompt}])
     return res.choices[0].message.content or ""
 
+def execute_tool_call(tool_name, raw_arguments=None):
+    tool_function = globals().get(tool_name)
+    if tool_function is None:
+        return f"Unbekanntes Tool: {tool_name}"
+    raw_arguments = raw_arguments or "{}"
+    try:
+        arguments = json.loads(raw_arguments)
+        if not isinstance(arguments, dict):
+            raise ValueError("Tool-Argumente müssen ein JSON-Objekt sein.")
+        return tool_function(**arguments)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        return f"Ungültige Argumente für {tool_name}: {error}"
+
+
+def detect_and_execute_plaintext_tool(response_text):
+    if not response_text or not isinstance(response_text, str):
+        return None
+    text = response_text.strip()
+    if not text:
+        return None
+
+    no_arg_tools = {"keep_listening": keep_listening, "get_time": get_time}
+    argument_tools = {
+        "terminal_command": terminal_command,
+        "web_search": web_search,
+        "minecraft_command": minecraft_command,
+        "set_volume": set_volume,
+        "switch_language": switch_language,
+        "set_auto_language_switch": set_auto_language_switch,
+    }
+
+    lowered = text.casefold()
+    for tool_name, tool_function in no_arg_tools.items():
+        if lowered == tool_name.casefold() or re.fullmatch(rf"\s*{re.escape(tool_name)}\s*\(\s*\)\s*", text, re.IGNORECASE):
+            return tool_function()
+
+    for tool_name, tool_function in argument_tools.items():
+        pattern = rf"{re.escape(tool_name)}\s*\((.*)\)"
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            return execute_tool_call(tool_name, match.group(1))
+
+    for tool_name, tool_function in argument_tools.items():
+        if re.search(rf"\b{re.escape(tool_name)}\b", text, re.IGNORECASE):
+            return None
+
+    return None
+
+
 def ask_ai(text):
-    global conversation_history, summary
+    global conversation_history, summary, current_language
+    conversation_history[0] = {"role": "system", "content": build_system_prompt(current_language)}
     model_list = select_models(text)
     conversation_history.append({"role": "user", "content": text})
-    if len(conversation_history) > 10:
-        new_summary = summarize_conversation(conversation_history[1:-8]).strip()
+    if len(conversation_history) > 16 and time.time() - (getattr(ask_ai, "last_summary_ts", 0)) > 45:
+        new_summary = summarize_conversation(conversation_history[1:-8], current_language).strip()
         if new_summary:
             summary = f"{summary}\n{new_summary}" if summary else new_summary
-        conversation_history = [conversation_history[0]] + conversation_history[-8:]; save_memory()
+        conversation_history = [conversation_history[0]] + conversation_history[-8:]
+        ask_ai.last_summary_ts = time.time()
+        save_memory()
 
     response, _ = chat_with_fallback(conversation_history, model_list)
-    msg = response.choices[0].message
-    if msg.tool_calls:
+    tool_rounds = 0
+    while True:
+        msg = response.choices[0].message
+        if not msg.tool_calls:
+            ai_message = msg.content or ""
+            auto_tool_result = detect_and_execute_plaintext_tool(ai_message)
+            if auto_tool_result is not None:
+                ai_message = str(auto_tool_result)
+            break
+        if tool_rounds >= 5:
+            ai_message = "Ich konnte die angeforderte Aktion nicht abschließen."
+            break
+
         conversation_history.append(msg.model_dump(exclude_none=True))
         for tc in msg.tool_calls:
             tool_name = getattr(tc.function, "name", None)
-            tool_function = globals().get(tool_name)
-            if tool_function is None:
-                result = f"Unbekanntes Tool: {tool_name}"
-            else:
-                raw_arguments = getattr(tc.function, "arguments", None) or "{}"
-                try:
-                    arguments = json.loads(raw_arguments)
-                    if not isinstance(arguments, dict):
-                        raise ValueError("Tool-Argumente müssen ein JSON-Objekt sein.")
-                    result = tool_function(**arguments)
-                except (json.JSONDecodeError, TypeError, ValueError) as error:
-                    result = f"Ungültige Argumente für {tool_name}: {error}"
+            result = execute_tool_call(tool_name, getattr(tc.function, "arguments", None))
             conversation_history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-        final, _ = chat_with_fallback(conversation_history, model_list); ai_message = final.choices[0].message.content or ""
-    else: ai_message = msg.content or ""
+        tool_rounds += 1
+        response, _ = chat_with_fallback(conversation_history, model_list)
     conversation_history.append({"role": "assistant", "content": ai_message}); save_memory(); return ai_message
 
 # ========= 5. SPEECH LOOP =========
 r = sr.Recognizer()
+vosk_models = {}
+
+def recognize_offline(audio, language):
+    model_path = resolve_vosk_model_path(language)
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"Vosk {LANGUAGE_NAMES[language]} model directory not found: {model_path}")
+    if language not in vosk_models:
+        from vosk import Model
+        vosk_models[language] = Model(model_path)
+    from vosk import KaldiRecognizer
+    recognizer = KaldiRecognizer(vosk_models[language], 16000)
+    recognizer.AcceptWaveform(audio.get_raw_data(convert_rate=16000, convert_width=2))
+    result = json.loads(recognizer.FinalResult())
+    words = result.get("result", [])
+    confidence = sum(word.get("conf", 0) for word in words) / len(words) if words else 0
+    return result.get("text", ""), confidence
 
 def listen(timeout=60):
+    global current_language
     try:
         with sr.Microphone(**MIC_ARGS) as source:
-            r.adjust_for_ambient_noise(source, duration=0.1)
+            if not getattr(r, "_jarvis_adjusted", False):
+                r.adjust_for_ambient_noise(source, duration=0.05)
+                r._jarvis_adjusted = True
             print("...höre zu")
 
-            r.pause_threshold = 1.0
-            r.phrase_threshold = 0.3
-            r.non_speaking_duration = 1.0
+            r.pause_threshold = 0.8
+            r.phrase_threshold = 0.35
+            r.non_speaking_duration = 0.7
 
             audio = r.listen(
                 source,
-                timeout=timeout,
-                phrase_time_limit=20
+                timeout=min(timeout, LISTEN_TIMEOUT),
+                phrase_time_limit=min(20, LISTEN_PHRASE_LIMIT)
             )
 
-        text = r.recognize_google(audio, language="de-DE")
-        print(f"Du: {text}")
+        candidates = []
+        preferred_languages = [current_language]
+        if auto_language_switch:
+            preferred_languages += [
+                language for language in SUPPORTED_LANGUAGES
+                if language != current_language
+                and os.path.isfile(os.path.join(resolve_vosk_model_path(language), "am", "final.mdl"))
+            ]
+        for language in preferred_languages:
+            try:
+                if OFFLINE:
+                    transcript, confidence = recognize_offline(audio, language)
+                else:
+                    transcript = r.recognize_google(audio, language=LANGUAGE_LOCALES[language])
+                    confidence = 0
+                if transcript:
+                    candidates.append((language, transcript, confidence))
+            except sr.UnknownValueError:
+                continue
+            except FileNotFoundError as error:
+                print(f"[ASR] {error}")
+
+        text, transcript_language = choose_transcript(candidates, current_language)
+        if not text:
+            print("Nichts verstanden")
+            return None
+        if auto_language_switch:
+            current_language = transcript_language
+        print(f"Du ({LANGUAGE_NAMES[current_language]}): {text}")
         return text
 
     except sr.WaitTimeoutError:
@@ -935,7 +1386,7 @@ if __name__ == "__main__":
                 if user_text:
                     answer = ask_ai(user_text)
                     print(f"Jarvis: {answer}")
-                    speak(answer)
+                    speak(answer, current_language)
                     
             finally:
                 prediction = {}
