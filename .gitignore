@@ -1,0 +1,39 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Conversation state and local user data
+memory.json
+memory.json.*
+
+# Downloaded speech models and archives (large binary assets)
+models/
+voices/
+*.onnx
+*.onnx.json
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Logs, temporary files, and OS metadata
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

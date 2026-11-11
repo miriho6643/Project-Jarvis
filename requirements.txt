@@ -1,0 +1,11 @@
+openai
+python-dotenv
+numpy
+SpeechRecognition
+PyAudio
+openwakeword
+sounddevice
+piper-tts
+vosk
+mcrcon
+requests
