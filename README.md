@@ -6,6 +6,7 @@ A personal, voice-controlled assistant for Windows. Jarvis connects to a local O
 
 - Local Ollama or OpenRouter chat completions
 - Wake-word and microphone input
+- Switchable `wakeword` and `always_listening` activation modes
 - Vosk offline speech recognition and Piper text-to-speech
 - Language switching and automatic input-language detection
 - Home Assistant device controls and Minecraft RCON commands
@@ -68,6 +69,7 @@ Model files are intentionally excluded from GitHub by `.gitignore`. They are dow
 | `LANGUAGES` | `all` or comma-separated catalog codes |
 | `DEFAULT_LANGUAGE` | Initial language; must be enabled in `LANGUAGES` |
 | `AUTO_LANGUAGE_SWITCH` | Enable or disable automatic input-language switching |
+| `ACTIVATION_MODE` | `wakeword` waits for “Hey Jarvis”; `always_listening` processes every recognized utterance |
 | `AUTO_INSTALL_ASSETS` | Download a missing active language's assets automatically |
 | `HA_URL`, `BEARER_TOKEN` | Optional Home Assistant API connection |
 | `MC_RCON_HOST`, `MC_RCON_PORT`, `MC_RCON_PASSWORD` | Optional Minecraft RCON connection |
@@ -80,7 +82,7 @@ The assistant also stores active language and conversation history in `memory.js
 python main.py
 ```
 
-Say the configured wake word, then speak. Choose another language by asking Jarvis to switch language, or configure `DEFAULT_LANGUAGE` in `.env`. The microphone device index is currently set in `MIC_ARGS` in `main.py` and may need adjustment for your computer.
+In `wakeword` mode, say “Hey Jarvis” before speaking. In `always_listening` mode, Jarvis continuously listens for recognized speech and responds without a wake word; it waits until its own speech finishes before listening again. Choose the mode in `.env` with `ACTIVATION_MODE=wakeword` or `ACTIVATION_MODE=always_listening`, or ask Jarvis to switch modes. The selected mode is saved in `memory.json` and takes precedence over `.env` on later starts. Always-listening can react to nearby conversation or media, so use it in a suitable private environment. Choose another language by asking Jarvis to switch language, or configure `DEFAULT_LANGUAGE` in `.env`. The microphone device index is currently set in `MIC_ARGS` in `main.py` and may need adjustment for your computer.
 
 ## Security notes
 

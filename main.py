@@ -3,9 +3,7 @@ from openai import OpenAI
 import os, json, re, threading, time, subprocess, requests, zipfile
 from html.parser import HTMLParser
 from urllib.parse import urlencode
-import numpy as np
 import speech_recognition as sr
-import openwakeword
 import sounddevice as sd
 from piper import PiperVoice
 from mcrcon import MCRcon # pip install mcrcon
@@ -54,6 +52,10 @@ AUTO_INSTALL_ASSETS = os.getenv("AUTO_INSTALL_ASSETS", "true").strip().lower() =
 FAST_MODE = os.getenv("FAST_MODE", "true").strip().lower() == "true"
 LISTEN_TIMEOUT = max(5, min(int(os.getenv("LISTEN_TIMEOUT", "12")), 20))
 LISTEN_PHRASE_LIMIT = max(4, min(int(os.getenv("LISTEN_PHRASE_LIMIT", "8")), 15))
+ACTIVATION_MODES = {"wakeword", "always_listening"}
+ACTIVATION_MODE_DEFAULT = os.getenv("ACTIVATION_MODE", "wakeword").strip().lower()
+if ACTIVATION_MODE_DEFAULT not in ACTIVATION_MODES:
+    raise ValueError("ACTIVATION_MODE must be 'wakeword' or 'always_listening'")
 
 OFFLINE = AI_PROVIDER == "ollama"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
@@ -153,15 +155,15 @@ def choose_transcript(candidates, fallback_language=None):
 
 def build_system_prompt(language):
     prompts = {
-        "de": "Du bist Jarvis und antwortest ausschließlich auf Deutsch, ohne Formatierungen, Listen oder Emojis. Nutze die bereitgestellten Funktionen für Aktionen, statt deren Ergebnisse zu erfinden oder ihren Namen im Text zu nennen. Home Assistant über die passende Gerätefunktion mit do/with, Minecraft über minecraft_command, aktuelle Websuche über web_search, lokale Uhrzeit über get_time und terminal_command nur für ausdrücklich gewünschte lokale Befehle. Bei einem gewünschten Sprachwechsel rufe switch_language auf; für die automatische Spracherkennung nutze set_auto_language_switch. Wenn du eine Rückfrage stellst oder der Nutzer eine Folgefrage ankündigt, rufe keep_listening direkt auf und schreibe den Tool-Namen niemals als Text an den Nutzer.",
-        "en": "You are Jarvis. Always reply only in English, with no formatting, lists, or emojis. Use the provided tools for actions instead of inventing results or naming tool functions in plain text. Use the matching Home Assistant device function with do/with, minecraft_command for Minecraft, web_search for current information, get_time for the local time, and terminal_command only for explicitly requested local actions. For a requested language change, call switch_language; use set_auto_language_switch to enable or disable automatic language detection. If you ask a follow-up question or the user announces one, call keep_listening directly and never write the tool name as user-facing text.",
-        "pl": "Jesteś Jarvisem. Odpowiadaj wyłącznie po polsku. Korzystaj z dostępnych narzędzi, aby wykonywać działania, zamiast opisywać ich nazwy. Na prośbę o zmianę języka wywołaj switch_language, a aby włączyć lub wyłączyć automatyczne rozpoznawanie języka, użyj set_auto_language_switch. Na pytania uzupełniające odpowiadaj po polsku.",
-        "ru": "Ты Jarvis. Отвечай только по-русски. Используй доступные инструменты для выполнения действий, не называй их пользователю. Для смены языка вызывай switch_language, а для включения или отключения автоматического определения языка используй set_auto_language_switch. На уточняющие вопросы отвечай по-русски.",
-        "it": "Sei Jarvis. Rispondi esclusivamente in italiano. Usa gli strumenti disponibili per eseguire le azioni, senza mostrarne i nomi all'utente. Per cambiare lingua chiama switch_language; per attivare o disattivare il rilevamento automatico della lingua usa set_auto_language_switch. Rispondi in italiano anche alle domande di approfondimento."
+        "de": "Du bist Jarvis und antwortest ausschließlich auf Deutsch, ohne Formatierungen, Listen oder Emojis. Nutze die bereitgestellten Funktionen für Aktionen, statt deren Ergebnisse zu erfinden oder ihren Namen im Text zu nennen. Home Assistant über die passende Gerätefunktion mit do/with, Minecraft über minecraft_command, aktuelle Websuche über web_search, lokale Uhrzeit über get_time und terminal_command nur für ausdrücklich gewünschte lokale Befehle. Bei einem gewünschten Sprachwechsel rufe switch_language auf; für die automatische Spracherkennung nutze set_auto_language_switch. Wenn der Nutzer den Aktivierungsmodus ändern möchte, rufe set_activation_mode mit wakeword oder always_listening auf. Wenn du eine Rückfrage stellst oder der Nutzer eine Folgefrage ankündigt, rufe keep_listening direkt auf und schreibe den Tool-Namen niemals als Text an den Nutzer.",
+        "en": "You are Jarvis. Always reply only in English, with no formatting, lists, or emojis. Use the provided tools for actions instead of inventing results or naming tool functions in plain text. Use the matching Home Assistant device function with do/with, minecraft_command for Minecraft, web_search for current information, get_time for the local time, and terminal_command only for explicitly requested local actions. For a requested language change, call switch_language; use set_auto_language_switch to enable or disable automatic language detection. If the user asks to change activation mode, call set_activation_mode with wakeword or always_listening. If you ask a follow-up question or the user announces one, call keep_listening directly and never write the tool name as user-facing text.",
+        "pl": "Jesteś Jarvisem. Odpowiadaj wyłącznie po polsku. Korzystaj z dostępnych narzędzi, aby wykonywać działania, zamiast opisywać ich nazwy. Na prośbę o zmianę języka wywołaj switch_language, a aby włączyć lub wyłączyć automatyczne rozpoznawanie języka, użyj set_auto_language_switch. Tryb aktywacji zmieniaj przez set_activation_mode z wartością wakeword lub always_listening. Na pytania uzupełniające odpowiadaj po polsku.",
+        "ru": "Ты Jarvis. Отвечай только по-русски. Используй доступные инструменты для выполнения действий, не называй их пользователю. Для смены языка вызывай switch_language, а для включения или отключения автоматического определения языка используй set_auto_language_switch. Режим активации меняй через set_activation_mode со значением wakeword или always_listening. На уточняющие вопросы отвечай по-русски.",
+        "it": "Sei Jarvis. Rispondi esclusivamente in italiano. Usa gli strumenti disponibili per eseguire le azioni, senza mostrarne i nomi all'utente. Per cambiare lingua chiama switch_language; per attivare o disattivare il rilevamento automatico della lingua usa set_auto_language_switch. Cambia la modalità di attivazione con set_activation_mode e wakeword oppure always_listening. Rispondi in italiano anche alle domande di approfondimento."
     }
     return prompts.get(
         language,
-        f"You are Jarvis. Reply only in {LANGUAGE_NAMES[language]} ({language}). Use available tools to perform actions and do not mention tool names to the user."
+        f"You are Jarvis. Reply only in {LANGUAGE_NAMES[language]} ({language}). Use available tools to perform actions and do not mention tool names to the user. For activation changes call set_activation_mode with wakeword or always_listening."
     )
 
 MODELS = [
@@ -410,8 +412,6 @@ MIC_ARGS = {"sample_rate": 16000, "chunk_size": 1280, "device_index": 1} # Mikro
 tools = []
 device_lock = threading.Lock()
 keep_listening_event = threading.Event()
-if not OFFLINE:
-    openwakeword.utils.download_models()
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
@@ -521,6 +521,7 @@ conversation_history = DEFAULT_HISTORY.copy()
 summary = ""
 current_language = DEFAULT_LANGUAGE
 auto_language_switch = AUTO_LANGUAGE_SWITCH_DEFAULT
+activation_mode = ACTIVATION_MODE_DEFAULT
 if os.path.exists(MEMORY_FILE):
     try:
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
@@ -531,6 +532,9 @@ if os.path.exists(MEMORY_FILE):
         if current_language not in SUPPORTED_LANGUAGES:
             current_language = DEFAULT_LANGUAGE
         auto_language_switch = data.get("auto_language_switch", AUTO_LANGUAGE_SWITCH_DEFAULT)
+        activation_mode = data.get("activation_mode", ACTIVATION_MODE_DEFAULT)
+        if activation_mode not in ACTIVATION_MODES:
+            activation_mode = ACTIVATION_MODE_DEFAULT
     except (OSError, json.JSONDecodeError) as error:
         backup_file = MEMORY_FILE + ".corrupt"
         try:
@@ -546,6 +550,7 @@ def save_memory():
         "summary": summary,
         "language": current_language,
         "auto_language_switch": auto_language_switch,
+        "activation_mode": activation_mode,
     }
     with open(temporary_file, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -575,6 +580,8 @@ if DEFAULT_LANGUAGE not in tts_voices:
     print(f"[TTS] No valid Piper voice for default language {LANGUAGE_NAMES[DEFAULT_LANGUAGE]} in {TTS_MODEL_PATHS[DEFAULT_LANGUAGE]}; speech output is disabled until a valid voice is present.")
 
 tts_lock = threading.Lock()
+tts_finished_event = threading.Event()
+tts_finished_event.set()
 
 def speak(text, language=None):
     if not text or not tts_voices:
@@ -602,7 +609,10 @@ def speak(text, language=None):
                     audio_stream.close()
         except Exception as error:
             print(f"[TTS ERROR] {error}")
+        finally:
+            tts_finished_event.set()
 
+    tts_finished_event.clear()
     threading.Thread(target=synthesize_and_play, daemon=True).start()
 
 # ========= 2. HA + MC TOOL GENERATOR =========
@@ -936,13 +946,36 @@ def set_auto_language_switch(enabled: bool):
         "ru": ("Автоматическое переключение языка включено.", "Автоматическое переключение языка выключено."),
         "it": ("Rilevamento automatico della lingua attivato.", "Rilevamento automatico della lingua disattivato."),
     }
-    return status_messages[current_language][0 if enabled else 1]
+    messages = status_messages.get(current_language, ("Automatic language switching enabled.", "Automatic language switching disabled."))
+    return messages[0 if enabled else 1]
+
+
+def set_activation_mode(mode: str):
+    mode = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {"always": "always_listening", "continuous": "always_listening", "wake_word": "wakeword"}
+    mode = aliases.get(mode, mode)
+    if mode not in ACTIVATION_MODES:
+        return f"Activation mode must be one of: {', '.join(sorted(ACTIVATION_MODES))}"
+
+    if mode == "wakeword":
+        try:
+            ensure_wakeword_model()
+        except Exception as error:
+            return f"Could not start wakeword mode: {error}"
+
+    global activation_mode
+    activation_mode = mode
+    save_memory()
+    if mode == "wakeword":
+        return "Wakeword mode enabled." if current_language != "de" else "Wakeword-Modus aktiviert."
+    return "Always-listening mode enabled. Jarvis will respond to recognized speech." if current_language != "de" else "Dauerhören aktiviert. Jarvis reagiert auf erkannte Sprache."
 
 static_tools = [
     {"type": "function", "function": {"name": "set_volume", "description": "PC Lautstärke", "parameters": {"type": "object", "properties": {"level": {"type": "integer"}}, "required": ["level"]}}},
     {"type": "function", "function": {"name": "get_time", "description": "Gibt die aktuelle lokale Uhrzeit und das Datum zurück. Verwende diese Funktion, wenn der Nutzer nach Uhrzeit oder Datum fragt.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "switch_language", "description": "Wechselt sofort Jarvis' Antwort- und Sprachausgabesprache. Verwende dieses Tool, wenn der Nutzer ausdrücklich die Sprache wechseln möchte. Die Auswahl wird gespeichert.", "parameters": {"type": "object", "properties": {"language": {"type": "string", "enum": list(SUPPORTED_LANGUAGES), "description": "Zielsprache"}}, "required": ["language"]}}},
-    {"type": "function", "function": {"name": "set_auto_language_switch", "description": "Aktiviert oder deaktiviert die automatische Erkennung und Umschaltung der Sprache anhand der Nutzereingabe. Die Einstellung wird gespeichert.", "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean", "description": "true zum Aktivieren, false zum Deaktivieren"}}, "required": ["enabled"]}}}
+    {"type": "function", "function": {"name": "set_auto_language_switch", "description": "Aktiviert oder deaktiviert die automatische Erkennung und Umschaltung der Sprache anhand der Nutzereingabe. Die Einstellung wird gespeichert.", "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean", "description": "true zum Aktivieren, false zum Deaktivieren"}}, "required": ["enabled"]}}},
+    {"type": "function", "function": {"name": "set_activation_mode", "description": "Wähle Jarvis-Aktivierung: wakeword wartet auf 'Hey Jarvis'; always_listening verarbeitet jede erkannte Sprache ohne Wakeword. Speichert die Einstellung.", "parameters": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["wakeword", "always_listening"]}}, "required": ["mode"]}}}
 ]
 
 # ========= 4. CORE KI LOGIK =========
@@ -1210,6 +1243,7 @@ def detect_and_execute_plaintext_tool(response_text):
         "set_volume": set_volume,
         "switch_language": switch_language,
         "set_auto_language_switch": set_auto_language_switch,
+        "set_activation_mode": set_activation_mode,
     }
 
     lowered = text.casefold()
@@ -1351,46 +1385,67 @@ def listen(timeout=60):
         print(f"[MIC ERROR] {e}")
         return None
 
+def ensure_wakeword_model():
+    global wakeword_model
+    if wakeword_model is None:
+        import openwakeword
+        if not OFFLINE:
+            openwakeword.utils.download_models()
+        wakeword_model = openwakeword.Model(
+            wakeword_models=[WAKEWORD_MODEL],
+            inference_framework="onnx"
+        )
+        time.sleep(5)
+    return wakeword_model
+
+
+def wait_for_activation():
+    global wakeword_model
+    if keep_listening_event.is_set():
+        keep_listening_event.clear()
+        print(">>> Folgefrage ohne Wakeword. <<<")
+        return
+
+    if activation_mode == "always_listening":
+        tts_finished_event.wait()
+        print(">>> Dauerhören aktiv. <<<")
+        return
+
+    model = ensure_wakeword_model()
+    import numpy as np
+    with sr.Microphone(**MIC_ARGS) as source:
+        while True:
+            audio_bytes = source.stream.read(MIC_ARGS["chunk_size"])
+            audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+            if len(audio_data) != MIC_ARGS["chunk_size"]:
+                continue
+
+            prediction = model.predict(audio_data)
+            if prediction.get(WAKEWORD_MODEL, 0) > 0.5:
+                print(">>> Wakeword erkannt! <<<")
+                model.reset()
+                return
+
+
 if __name__ == "__main__":
-    print(">>> Lade Wakeword...")
-    oww = openwakeword.Model(wakeword_models=[WAKEWORD_MODEL], inference_framework="onnx"); time.sleep(5)
-    print(">>> Sag 'Hey Jarvis' <<<")
+    wakeword_model = None
+    if activation_mode == "wakeword":
+        print(">>> Lade Wakeword...")
+        ensure_wakeword_model()
+        print(">>> Sag 'Hey Jarvis' <<<")
+    else:
+        print(">>> Dauerhören aktiv. Sprich, wenn du Jarvis etwas sagen möchtest. <<<")
+
     while True:
         try:
-            if keep_listening_event.is_set():
-                keep_listening_event.clear()
-            else:
-                with sr.Microphone(**MIC_ARGS) as source:
-                    # Wakeword detection must process short, continuous 16 kHz PCM frames.
-                    while True:
-                        if keep_listening_event.is_set():
-                            keep_listening_event.clear()
-                            print(">>> Folgefrage ohne Wakeword. <<<")
-                            break
-
-                        audio_bytes = source.stream.read(MIC_ARGS["chunk_size"])
-                        audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
-                        if len(audio_data) != MIC_ARGS["chunk_size"]:
-                            continue
-
-                        prediction = oww.predict(audio_data)
-                        if prediction.get(WAKEWORD_MODEL, 0) > 0.5:
-                            print(">>> Wakeword erkannt! <<<")
-                            prediction = {}
-                            oww.reset()
-                            break
-
-            try:
-                user_text = listen()
-
-                if user_text:
-                    answer = ask_ai(user_text)
-                    print(f"Jarvis: {answer}")
-                    speak(answer, current_language)
-                    
-            finally:
-                prediction = {}
-                oww.reset()
+            wait_for_activation()
+            user_text = listen()
+            if user_text:
+                answer = ask_ai(user_text)
+                print(f"Jarvis: {answer}")
+                speak(answer, current_language)
+            if wakeword_model is not None:
+                wakeword_model.reset()
 
         except KeyboardInterrupt:
             save_memory()
