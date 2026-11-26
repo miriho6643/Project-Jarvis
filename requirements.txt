@@ -9,3 +9,6 @@ piper-tts
 vosk
 mcrcon
 requests
+fastapi
+uvicorn[standard]
+websockets

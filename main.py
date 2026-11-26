@@ -1326,7 +1326,8 @@ def listen(timeout=60):
             if not getattr(r, "_jarvis_adjusted", False):
                 r.adjust_for_ambient_noise(source, duration=0.05)
                 r._jarvis_adjusted = True
-            print("...höre zu")
+            if activation_mode == "wakeword":
+                print("...höre zu")
 
             r.pause_threshold = 0.8
             r.phrase_threshold = 0.35
@@ -1361,7 +1362,7 @@ def listen(timeout=60):
                 print(f"[ASR] {error}")
 
         text, transcript_language = choose_transcript(candidates, current_language)
-        if not text:
+        if not text and activation_mode == "wakeword":
             print("Nichts verstanden")
             return None
         if auto_language_switch:
@@ -1408,7 +1409,6 @@ def wait_for_activation():
 
     if activation_mode == "always_listening":
         tts_finished_event.wait()
-        print(">>> Dauerhören aktiv. <<<")
         return
 
     model = ensure_wakeword_model()

@@ -73,6 +73,13 @@ Model files are intentionally excluded from GitHub by `.gitignore`. They are dow
 | `AUTO_INSTALL_ASSETS` | Download a missing active language's assets automatically |
 | `HA_URL`, `BEARER_TOKEN` | Optional Home Assistant API connection |
 | `MC_RCON_HOST`, `MC_RCON_PORT`, `MC_RCON_PASSWORD` | Optional Minecraft RCON connection |
+| `ACTIVATION_MODE` | `wakeword` or `always_listening` |
+| `JARVIS_DASHBOARD_TOKEN` | Dashboard/API bearer token for management requests |
+| `JARVIS_STATION_TOKEN` | Shared station credential for the configured station ID |
+| `STATION_TOKENS` | JSON mapping of station IDs to unique station credentials |
+| `JARVIS_SERVER_HOST`, `JARVIS_SERVER_PORT` | Central server bind address and port |
+| `JARVIS_MEMORY_DB` | SQLite memory database location |
+| `JARVIS_SERVER_URL` | Station client server URL |
 
 The assistant also stores active language and conversation history in `memory.json`, which is local and ignored by Git.
 
@@ -81,6 +88,26 @@ The assistant also stores active language and conversation history in `memory.js
 ```powershell
 python main.py
 ```
+
+## Central server
+
+Start the authenticated central gateway:
+
+```powershell
+uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+Set `JARVIS_DASHBOARD_TOKEN` and unique station credentials in `.env` before exposing it on the network. Station credentials can be configured individually with `STATION_TOKENS` as a JSON object. The dashboard is available at `http://SERVER:8000/` and requires the dashboard token for API data.
+
+## Raspberry Pi station
+
+On a Raspberry Pi 4, install the requirements and run:
+
+```bash
+python station_client.py --server http://CENTRAL-SERVER:8000 --station-id livingroom --room "Living Room" --token STATION-SECRET --mode wakeword
+```
+
+The station performs local wakeword detection, sends audio to the server, plays centralized TTS audio, and reconnects automatically. Use `--mode always_listening` for continuous station capture. Configure the Pi microphone with `MIC_DEVICE` or `--device`.
 
 In `wakeword` mode, say “Hey Jarvis” before speaking. In `always_listening` mode, Jarvis continuously listens for recognized speech and responds without a wake word; it waits until its own speech finishes before listening again. Choose the mode in `.env` with `ACTIVATION_MODE=wakeword` or `ACTIVATION_MODE=always_listening`, or ask Jarvis to switch modes. The selected mode is saved in `memory.json` and takes precedence over `.env` on later starts. Always-listening can react to nearby conversation or media, so use it in a suitable private environment. Choose another language by asking Jarvis to switch language, or configure `DEFAULT_LANGUAGE` in `.env`. The microphone device index is currently set in `MIC_ARGS` in `main.py` and may need adjustment for your computer.
 

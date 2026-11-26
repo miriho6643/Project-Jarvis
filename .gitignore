@@ -6,6 +6,8 @@
 # Conversation state and local user data
 memory.json
 memory.json.*
+memory/*.sqlite3
+memory/*.sqlite3-*
 
 # Downloaded speech models and archives (large binary assets)
 models/
